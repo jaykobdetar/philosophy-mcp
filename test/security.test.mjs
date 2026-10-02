@@ -19,6 +19,7 @@ import {
   normalizeArchiveIdentifier,
   normalizeSepEntry,
   normalizeWikisourceLang,
+  parseSepIndex,
 } from "../dist/books.js";
 import { LruCache } from "../dist/textwindow.js";
 import { parseJsonSafely, parseXmlSafely } from "../dist/xml.js";
@@ -28,6 +29,19 @@ test("HTML stripping remains linear on repeated unclosed tags", () => {
   const started = performance.now();
   assert.equal(htmlToText(hostile), "");
   assert.ok(performance.now() - started < 2_000, "hostile HTML took too long to strip");
+});
+
+test("HTML scanners preserve Unicode text and original offsets", () => {
+  assert.equal(htmlToText("<nav>İ</nav>Ethics"), "Ethics");
+  assert.equal(htmlToText("<NAV>İ</NAV><P>İ Ethics</P><p>Justice</p>"), "İ Ethics\n\nJustice");
+  assert.equal(htmlToText("<nav>I</nav>Ethics"), "Ethics");
+  assert.deepEqual(
+    parseSepIndex('İ <A HREF="entries/ethics/">İ Ethics</A><a href="entries/justice/">Justice</a>'),
+    [
+      ["İ Ethics", "https://plato.stanford.edu/entries/ethics/"],
+      ["Justice", "https://plato.stanford.edu/entries/justice/"],
+    ],
+  );
 });
 
 test("metadata XML parsing is worker-isolated and input-bounded", async () => {

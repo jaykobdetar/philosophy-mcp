@@ -198,8 +198,8 @@ that attempts to influence an AI client. Keep tool approvals enabled for consequ
 run the server with a dedicated low-privilege account or sandbox when handling adversarial files.
 For hostile PDFs, also apply an OS/container memory limit: the parser subprocess has a V8 heap
 limit and wall timeout, but those do not hard-cap every native or typed-array allocation. MCP
-cancellation is handled conservatively, so canceled work may retain a bounded slot until its own
-deadline or until the client reconnects.
+cancellation retains an admission slot while handled work or a response write is unfinished,
+then reclaims it at terminal SDK cleanup even when a canceled response is suppressed.
 On non-Linux POSIX systems, local-file validation combines trusted path-component checks with
 repeated canonical-path and inode checks because Node does not expose Linux's descriptor path.
 Windows local-document access and PDF publication fail closed because Node cannot enforce the

@@ -29,6 +29,7 @@ import { MAX_PDF_BYTES, savePdfSafely } from "./download.js";
 import { headerValue, hostAllowlistPolicy, secureRequest, type UrlPolicy } from "./net.js";
 import { extractPdfSafely, shutdownPdfParsers } from "./pdf.js";
 import { parseJsonSafely, parseXmlSafely } from "./xml.js";
+import { trackCanceledRequestCompletion } from "./request-lifecycle.js";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -366,7 +367,7 @@ class BoundedStdioServerTransport extends StdioServerTransport {
     return `${typeof id}:${String(id)}`;
   }
 
-  private releaseInbound(id: unknown): void {
+  releaseInbound(id: unknown): void {
     const key = this.requestKey(id);
     if (!this.inboundRequests.delete(key)) return;
     this.boundedInput.completeFrame();
@@ -386,9 +387,8 @@ class BoundedStdioServerTransport extends StdioServerTransport {
     // server, so their own admission slot completes as soon as they dispatch.
     // Do not release a target request for notifications/cancelled here: unknown
     // methods have no SDK AbortController but may already have a backpressured
-    // error response queued. A cancellation may therefore only conservatively
-    // retain the target slot until a response is written or the connection hits
-    // its bounded in-flight limit and closes.
+    // error response queued. Handled canceled requests are released by the
+    // SDK's terminal cleanup after work and any pending write finish.
     this.boundedInput.completeFrame();
   }
 
@@ -1031,6 +1031,7 @@ registerLocalTools(server);
 async function main() {
   const input = new LineLimitedInput();
   const transport = new BoundedStdioServerTransport(input);
+  trackCanceledRequestCompletion(server.server, (id) => transport.releaseInbound(id));
   const keepAlive = setInterval(() => {}, 60_000);
   let finishTerminal!: (error?: Error) => void;
   const terminal = new Promise<Error | undefined>((resolve) => {

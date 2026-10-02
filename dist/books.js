@@ -193,7 +193,9 @@ function decodeEntities(s) {
  * here, but malformed repeated opening tags make those patterns quadratic.
  */
 export function htmlToText(html) {
-    const lower = html.toLowerCase();
+    // HTML markup is ASCII case-insensitive. Unicode lowercasing can expand
+    // characters such as İ and shift offsets relative to the original text.
+    const lower = asciiLowercase(html);
     const dropContent = new Set([
         "script", "style", "noscript", "template", "svg",
         "nav", "header", "footer", "aside", "form",
@@ -257,6 +259,9 @@ export function htmlToText(html) {
         .replace(/ *\n */g, "\n")
         .replace(/\n{3,}/g, "\n\n")
         .trim();
+}
+function asciiLowercase(value) {
+    return value.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
 }
 /**
  * Cache of fully-fetched/extracted bodies, keyed by source (e.g. "gut:1234",
@@ -394,58 +399,61 @@ async function getSepIndex() {
             maxBytes: MAX_REMOTE_METADATA_BYTES,
             urlPolicy: SEP_POLICY,
         });
-        const idx = [];
-        const seen = new Set();
-        const lower = html.toLowerCase();
-        let cursor = 0;
-        while (idx.length < 20_000) {
-            const anchorStart = lower.indexOf("<a", cursor);
-            if (anchorStart === -1)
-                break;
-            const afterName = lower[anchorStart + 2] ?? "";
-            if (afterName && !/[\s/>]/.test(afterName)) {
-                cursor = anchorStart + 2;
-                continue;
-            }
-            const tagEnd = html.indexOf(">", anchorStart + 2);
-            if (tagEnd === -1)
-                break;
-            if (tagEnd - anchorStart > 8192) {
-                cursor = tagEnd + 1;
-                continue;
-            }
-            const closeStart = lower.indexOf("</a", tagEnd + 1);
-            if (closeStart === -1)
-                break;
-            const closeEnd = html.indexOf(">", closeStart + 3);
-            if (closeEnd === -1)
-                break;
-            const opening = html.slice(anchorStart, tagEnd + 1);
-            const hrefMatch = opening.match(/\bhref\s*=\s*["']([^"']{1,2048})["']/i);
-            cursor = closeEnd + 1;
-            if (!hrefMatch)
-                continue;
-            const rawHref = hrefMatch[1];
-            if (!/^(?:https:\/\/plato\.stanford\.edu\/)?entries\//i.test(rawHref))
-                continue;
-            const inner = html.slice(tagEnd + 1, Math.min(closeStart, tagEnd + 1 + 64_000));
-            const title = htmlToText(inner).trim().slice(0, 1000);
-            let url;
-            try {
-                const path = rawHref.replace(/^https:\/\/plato\.stanford\.edu\//i, "");
-                url = normalizeSepEntry(`/${path.replace(/^\//, "")}`);
-            }
-            catch {
-                continue;
-            }
-            if (!title || seen.has(url))
-                continue;
-            seen.add(url);
-            idx.push([title, url]);
-        }
-        sepIndex = idx;
+        sepIndex = parseSepIndex(html);
     }
     return sepIndex;
+}
+export function parseSepIndex(html) {
+    const idx = [];
+    const seen = new Set();
+    const lower = asciiLowercase(html);
+    let cursor = 0;
+    while (idx.length < 20_000) {
+        const anchorStart = lower.indexOf("<a", cursor);
+        if (anchorStart === -1)
+            break;
+        const afterName = lower[anchorStart + 2] ?? "";
+        if (afterName && !/[\s/>]/.test(afterName)) {
+            cursor = anchorStart + 2;
+            continue;
+        }
+        const tagEnd = html.indexOf(">", anchorStart + 2);
+        if (tagEnd === -1)
+            break;
+        if (tagEnd - anchorStart > 8192) {
+            cursor = tagEnd + 1;
+            continue;
+        }
+        const closeStart = lower.indexOf("</a", tagEnd + 1);
+        if (closeStart === -1)
+            break;
+        const closeEnd = html.indexOf(">", closeStart + 3);
+        if (closeEnd === -1)
+            break;
+        const opening = html.slice(anchorStart, tagEnd + 1);
+        const hrefMatch = opening.match(/\bhref\s*=\s*["']([^"']{1,2048})["']/i);
+        cursor = closeEnd + 1;
+        if (!hrefMatch)
+            continue;
+        const rawHref = hrefMatch[1];
+        if (!/^(?:https:\/\/plato\.stanford\.edu\/)?entries\//i.test(rawHref))
+            continue;
+        const inner = html.slice(tagEnd + 1, Math.min(closeStart, tagEnd + 1 + 64_000));
+        const title = htmlToText(inner).trim().slice(0, 1000);
+        let url;
+        try {
+            const path = rawHref.replace(/^https:\/\/plato\.stanford\.edu\//i, "");
+            url = normalizeSepEntry(`/${path.replace(/^\//, "")}`);
+        }
+        catch {
+            continue;
+        }
+        if (!title || seen.has(url))
+            continue;
+        seen.add(url);
+        idx.push([title, url]);
+    }
+    return idx;
 }
 // ---------------------------------------------------------------------------
 // Tool registration

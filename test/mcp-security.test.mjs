@@ -157,6 +157,44 @@ test("cancellation notifications cannot bypass stdio admission", async (t) => {
   assert.notEqual(exit.code, 0);
 });
 
+test("completed ordinary cancellations leave subsequent MCP requests usable", { timeout: 10_000 }, async (t) => {
+  const child = spawn(process.execPath, ["dist/index.js"], {
+    cwd: projectRoot,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  t.after(() => {
+    if (child.exitCode === null) child.kill("SIGKILL");
+  });
+  child.stdin.on("error", () => {});
+  const initialized = readLine(child.stdout);
+  child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0", id: 1, method: "initialize",
+    params: {
+      protocolVersion: "2025-06-18", capabilities: {},
+      clientInfo: { name: "ordinary-cancellation", version: "1.0.0" },
+    },
+  })}\n`);
+  assert.equal(JSON.parse(await initialized).id, 1);
+  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+  for (let index = 0; index < 18; index++) {
+    const canceledId = 100 + index * 2;
+    const nextId = canceledId + 1;
+    const reply = readLine(child.stdout);
+    child.stdin.write([
+      JSON.stringify({ jsonrpc: "2.0", id: canceledId, method: "ping" }),
+      JSON.stringify({
+        jsonrpc: "2.0", method: "notifications/cancelled",
+        params: { requestId: canceledId, reason: "user changed the selected view" },
+      }),
+      JSON.stringify({ jsonrpc: "2.0", id: nextId, method: "ping" }),
+    ].join("\n") + "\n");
+    assert.equal(JSON.parse(await reply).id, nextId);
+  }
+  const toolsReply = readLine(child.stdout);
+  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 200, method: "tools/list" })}\n`);
+  assert.equal(JSON.parse(await toolsReply).result.tools.length, 20);
+});
+
 test("stdio shutdown discards a backpressured response backlog", async (t) => {
   const child = spawn(process.execPath, ["dist/index.js"], {
     cwd: projectRoot,
