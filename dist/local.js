@@ -13,27 +13,32 @@
  *
  * Tools:
  *   - local_doc_info    overview: pages, chars, ~tokens, heuristic outline
- *   - local_doc_search  find passages by keyword/regex → snippets + page numbers
+ *   - local_doc_search  find literal passages → snippets + page numbers
  *   - local_doc_read    read a page range / chunk, capped so it can't flood context
  *
- * Security: only files under the user's home directory are readable by default;
- * extra roots can be allowed via the PHILOSOPHY_DOC_ROOTS env var (delimiter-
- * separated absolute paths). Paths are real-path resolved, so symlinks can't
- * escape the allowed roots.
+ * Security: local access is disabled until PHILOSOPHY_DOC_ROOTS contains one or
+ * more delimiter-separated absolute directories. Paths are real-path resolved,
+ * opened without following a final symlink, checked as regular files, and read
+ * under a byte limit.
  */
 import { z } from "zod";
-import { extractText, getDocumentProxy } from "unpdf";
-import { readFile, realpath, stat } from "node:fs/promises";
-import { homedir } from "node:os";
-import { basename, delimiter, extname, resolve, sep } from "node:path";
+import { constants } from "node:fs";
+import { lstat, open, realpath, stat } from "node:fs/promises";
+import { basename, delimiter, dirname, extname, isAbsolute, parse, relative, resolve, sep } from "node:path";
+import { LruCache } from "./textwindow.js";
+import { extractPdfSafely } from "./pdf.js";
 // ---------------------------------------------------------------------------
 // Small helpers (kept local so this module stays self-contained)
 // ---------------------------------------------------------------------------
 function ok(text) {
-    return { content: [{ type: "text", text }] };
+    const bounded = text.length <= 150_000
+        ? text
+        : `${text.slice(0, 150_000)}\n\n[output truncated at 150,000 characters]`;
+    return { content: [{ type: "text", text: bounded }] };
 }
 function fail(text) {
-    return { content: [{ type: "text", text }], isError: true };
+    const bounded = text.length <= 16_000 ? text : `${text.slice(0, 16_000)}…`;
+    return { content: [{ type: "text", text: bounded }], isError: true };
 }
 /** Same whitespace tidy-up the PDF path in index.ts uses. */
 function cleanText(s) {
@@ -42,44 +47,142 @@ function cleanText(s) {
         .replace(/\n{3,}/g, "\n\n")
         .trim();
 }
-function escapeRegex(s) {
-    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function envByteLimit(name, fallback, minimum, maximum) {
+    const raw = process.env[name];
+    if (!raw)
+        return fallback;
+    const parsed = Number(raw);
+    if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
+        throw new Error(`${name} must be an integer between ${minimum} and ${maximum} bytes.`);
+    }
+    return parsed;
+}
+function envIntegerLimit(name, fallback, minimum, maximum) {
+    const raw = process.env[name];
+    if (!raw)
+        return fallback;
+    const parsed = Number(raw);
+    if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
+        throw new Error(`${name} must be an integer between ${minimum} and ${maximum}.`);
+    }
+    return parsed;
 }
 /** Rough token estimate — ~4 chars per token is close enough for a heads-up. */
 function estTokens(chars) {
     return Math.ceil(chars / 4);
 }
-// ---------------------------------------------------------------------------
-// Path allowlist
-// ---------------------------------------------------------------------------
-let ROOTS = null;
-/** Real-path-resolved allowed roots: $HOME plus any PHILOSOPHY_DOC_ROOTS entries. */
-async function allowedRoots() {
-    if (ROOTS)
-        return ROOTS;
-    const raw = [homedir(), ...(process.env.PHILOSOPHY_DOC_ROOTS?.split(delimiter) ?? [])]
-        .map((s) => s.trim())
-        .filter(Boolean);
+/** Build a case-insensitive matcher without giving user input regex semantics. */
+function caseInsensitiveLiteral(input) {
+    const escaped = input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(escaped, "giu");
+}
+const pinnedRootConfigurations = new Map();
+async function validateRootAncestors(canonical) {
+    if (typeof process.getuid !== "function")
+        return;
+    const currentUid = process.getuid();
+    let current = canonical;
+    while (true) {
+        const parent = dirname(current);
+        if (parent === current)
+            break;
+        const info = await lstat(parent);
+        if (!info.isDirectory() || info.isSymbolicLink()) {
+            throw new Error(`Document-root ancestor is not a stable real directory: ${parent}`);
+        }
+        // A differently owned ancestor can be renamed by its owner even when its
+        // mode is 0755.  That would let another account exchange the pinned root
+        // with a sibling between our checks.  Root-owned ancestors are trusted;
+        // all others must belong to this process' effective account.
+        if (info.uid !== currentUid && info.uid !== 0) {
+            throw new Error(`Document-root ancestor has an untrusted owner: ${parent}`);
+        }
+        const writableByOthers = (info.mode & 0o022) !== 0;
+        const sticky = (info.mode & 0o1000) !== 0;
+        if (writableByOthers && !sticky) {
+            throw new Error(`Document-root ancestor is group/world writable: ${parent}`);
+        }
+        current = parent;
+    }
+}
+async function initializeRoots(raw) {
     const out = [];
     for (const r of raw) {
+        if (!isAbsolute(r)) {
+            throw new Error(`PHILOSOPHY_DOC_ROOTS entries must be absolute paths (got "${r}").`);
+        }
         try {
-            out.push(await realpath(resolve(r)));
+            const configured = resolve(r);
+            const entry = await lstat(configured);
+            if (entry.isSymbolicLink())
+                throw new Error("root entry is a symlink");
+            const canonical = await realpath(configured);
+            const st = await stat(canonical);
+            if (!st.isDirectory())
+                throw new Error("not a directory");
+            if (canonical === parse(canonical).root)
+                throw new Error("filesystem root is not allowed");
+            if (typeof process.getuid === "function") {
+                if (st.uid !== process.getuid())
+                    throw new Error("root is not owned by the current user");
+                if ((st.mode & 0o022) !== 0)
+                    throw new Error("root is group/world writable");
+            }
+            await validateRootAncestors(canonical);
+            out.push({ configured, canonical, dev: st.dev, ino: st.ino });
         }
         catch {
-            out.push(resolve(r)); // root may not exist yet; keep the literal form
+            throw new Error(`Configured document root is unsafe, missing, or not a real directory: ${r}`);
         }
     }
-    ROOTS = out.length ? out : [resolve(homedir())];
-    return ROOTS;
+    return out.filter((root, index, roots) => roots.findIndex((candidate) => candidate.canonical === root.canonical) === index);
+}
+export async function allowedRoots(configured = process.env.PHILOSOPHY_DOC_ROOTS) {
+    const raw = (configured?.split(delimiter) ?? []).map((s) => s.trim()).filter(Boolean);
+    if (raw.length === 0) {
+        throw new Error("Local document access is disabled. Set PHILOSOPHY_DOC_ROOTS to one or more " +
+            "absolute, dedicated document directories to enable it.");
+    }
+    if (process.platform === "win32") {
+        throw new Error("Local document access is unavailable on Windows because Node cannot enforce the " +
+            "required owner, permission, and descriptor-path checks; refusing to weaken confinement.");
+    }
+    if (raw.length > 64 || raw.some((entry) => entry.length > 4096)) {
+        throw new Error("PHILOSOPHY_DOC_ROOTS contains too many or overlong entries.");
+    }
+    const key = raw.map((entry) => resolve(entry)).join("\0");
+    let pending = pinnedRootConfigurations.get(key);
+    if (!pending) {
+        pending = initializeRoots(raw);
+        pinnedRootConfigurations.set(key, pending);
+        void pending.catch(() => pinnedRootConfigurations.delete(key));
+    }
+    const roots = await pending;
+    for (const root of roots) {
+        const entry = await lstat(root.configured);
+        if (entry.isSymbolicLink())
+            throw new Error(`Configured document root was replaced: ${root.configured}`);
+        const canonical = await realpath(root.configured);
+        const current = await stat(canonical);
+        if (canonical !== root.canonical ||
+            current.dev !== root.dev ||
+            current.ino !== root.ino ||
+            !current.isDirectory()) {
+            throw new Error(`Configured document root was replaced: ${root.configured}`);
+        }
+    }
+    return roots.map((root) => root.canonical);
 }
 /**
  * Resolve a client-supplied path to a real absolute path and verify it sits
  * under an allowed root. realpath() follows symlinks before the check, so a link
  * inside an allowed root that points outside it is rejected.
  */
-async function resolveAllowed(input) {
+export async function resolveAllowed(input, roots) {
     if (!input || !input.trim())
         throw new Error("No file path given.");
+    if (!isAbsolute(input.trim()))
+        throw new Error("Local document paths must be absolute.");
     const resolved = resolve(input.trim());
     let real;
     try {
@@ -88,62 +191,289 @@ async function resolveAllowed(input) {
     catch {
         throw new Error(`File not found or unreadable: ${resolved}`);
     }
-    const roots = await allowedRoots();
-    const allowed = roots.some((root) => real === root || real.startsWith(root + sep));
-    if (!allowed) {
-        throw new Error(`Path "${real}" is outside the allowed roots (${roots.join(", ")}). ` +
-            `Add its folder to the PHILOSOPHY_DOC_ROOTS env var to allow it.`);
-    }
+    const permittedRoots = roots ?? (await allowedRoots());
+    await assertTrustedAllowedPath(real, permittedRoots);
     return real;
 }
-const CACHE = new Map();
-const TEXT_EXTS = new Set([".txt", ".md", ".markdown", ".text", ".org", ".rst", ".tex", ".log", ""]);
+/** Verify a canonical path is contained by one of the configured roots. */
+function assertCanonicalAllowed(real, permittedRoots) {
+    const matchedRoot = permittedRoots.find((root) => {
+        const rel = relative(root, real);
+        return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+    });
+    if (!matchedRoot) {
+        throw new Error(`Path "${real}" is outside the configured document roots (${permittedRoots.join(", ")}).`);
+    }
+    const pathWithinRoot = relative(matchedRoot, real);
+    if (pathWithinRoot.split(sep).some((part) => part.startsWith("."))) {
+        throw new Error("Hidden files and hidden directories are not readable.");
+    }
+    return matchedRoot;
+}
+/**
+ * Reject path components another account could rename. Checking only the
+ * configured root is insufficient: a foreign-owned or group/world-writable
+ * descendant directory could exchange an outside inode into an allowed name
+ * while the file is opened. Root and current-user ownership are trusted.
+ */
+async function assertTrustedAllowedPath(real, permittedRoots) {
+    const matchedRoot = assertCanonicalAllowed(real, permittedRoots);
+    if (typeof process.getuid !== "function")
+        return;
+    const currentUid = process.getuid();
+    let current = dirname(real);
+    while (true) {
+        const info = await lstat(current);
+        if (!info.isDirectory() || info.isSymbolicLink()) {
+            throw new Error(`Document path component is not a stable real directory: ${current}`);
+        }
+        if (info.uid !== currentUid && info.uid !== 0) {
+            throw new Error(`Document path component has an untrusted owner: ${current}`);
+        }
+        if ((info.mode & 0o022) !== 0) {
+            throw new Error(`Document path component is group/world writable: ${current}`);
+        }
+        if (current === matchedRoot)
+            return;
+        const parent = dirname(current);
+        if (parent === current || relative(matchedRoot, parent).startsWith(`..${sep}`)) {
+            throw new Error("Document path changed outside its configured root.");
+        }
+        current = parent;
+    }
+}
+const MAX_LOCAL_FILE_BYTES = envByteLimit("PHILOSOPHY_MAX_LOCAL_FILE_BYTES", 32 * 1024 * 1024, 64 * 1024, 256 * 1024 * 1024);
+const MAX_LOCAL_CACHE_BYTES = envByteLimit("PHILOSOPHY_MAX_LOCAL_CACHE_BYTES", 64 * 1024 * 1024, 64 * 1024, 512 * 1024 * 1024);
+const MAX_EXTRACTED_CHARS = envByteLimit("PHILOSOPHY_MAX_EXTRACTED_CHARS", 20_000_000, 10_000, 100_000_000);
+const MAX_DOCUMENT_PAGES = envIntegerLimit("PHILOSOPHY_MAX_DOCUMENT_PAGES", 20_000, 1, 100_000);
+const CACHE = new LruCache(4, MAX_LOCAL_CACHE_BYTES, (doc) => {
+    // Include an allowance for each JS string/array entry so delimiter-heavy
+    // documents cannot have a near-zero cache weight.
+    return doc.pages.reduce((total, page) => total + Buffer.byteLength(page) + 256, 0);
+});
+const TEXT_EXTS = new Set([".txt", ".md", ".markdown", ".text", ".org", ".rst", ".tex"]);
+const MAX_ACTIVE_LOADS = 2;
+const MAX_QUEUED_LOADS = 8;
+let activeLoads = 0;
+const loadWaiters = [];
+const inFlightLoads = new Map();
+async function acquireLoadSlot() {
+    if (activeLoads < MAX_ACTIVE_LOADS) {
+        activeLoads++;
+    }
+    else {
+        if (loadWaiters.length >= MAX_QUEUED_LOADS) {
+            throw new Error("Too many local documents are being loaded; try again later.");
+        }
+        await new Promise((resolve) => loadWaiters.push(resolve));
+    }
+    let released = false;
+    return () => {
+        if (released)
+            return;
+        released = true;
+        const next = loadWaiters.shift();
+        if (next)
+            next();
+        else
+            activeLoads--;
+    };
+}
+async function readRegularFileLimited(real, permittedRoots) {
+    const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+    const nonBlock = typeof constants.O_NONBLOCK === "number" ? constants.O_NONBLOCK : 0;
+    // O_NONBLOCK ensures an allowed-root FIFO cannot pin a libuv worker before
+    // fstat has a chance to reject it as non-regular.
+    const handle = await open(real, constants.O_RDONLY | noFollow | nonBlock);
+    try {
+        const opened = await handle.stat();
+        if (!opened.isFile())
+            throw new Error("Local document path is not a regular file.");
+        // Bind the path allowlist decision to the descriptor we actually opened.
+        // An attacker may replace an intermediate directory with a symlink between
+        // resolveAllowed() and open(); re-resolve after open, re-check containment,
+        // and require the path to still identify this descriptor's inode.
+        const verifyOpenedPath = async () => {
+            if (process.platform === "linux") {
+                let descriptorTarget;
+                try {
+                    descriptorTarget = await realpath(`/proc/self/fd/${handle.fd}`);
+                }
+                catch {
+                    throw new Error("Unable to verify the opened document descriptor; refusing the read.");
+                }
+                await assertTrustedAllowedPath(descriptorTarget, permittedRoots);
+                return;
+            }
+            // Node does not expose openat2/fcntl(F_GETPATH) portably. On non-Linux
+            // systems, re-resolve and compare the path to the already-open inode.
+            let canonical;
+            try {
+                canonical = await realpath(real);
+            }
+            catch {
+                throw new Error("Local document path changed while it was being opened; retry the request.");
+            }
+            await assertTrustedAllowedPath(canonical, permittedRoots);
+            const current = await stat(canonical);
+            if (current.dev !== opened.dev || current.ino !== opened.ino) {
+                throw new Error("Local document changed while it was being opened; retry the request.");
+            }
+        };
+        await verifyOpenedPath();
+        if (opened.size > MAX_LOCAL_FILE_BYTES) {
+            throw new Error(`Local document is ${opened.size.toLocaleString()} bytes; the configured limit is ` +
+                `${MAX_LOCAL_FILE_BYTES.toLocaleString()} bytes.`);
+        }
+        const chunks = [];
+        let total = 0;
+        let position = 0;
+        while (true) {
+            const remaining = MAX_LOCAL_FILE_BYTES + 1 - total;
+            if (remaining <= 0)
+                throw new Error("Local document grew beyond the configured byte limit.");
+            const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, remaining));
+            const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
+            if (bytesRead === 0)
+                break;
+            chunks.push(chunk.subarray(0, bytesRead));
+            total += bytesRead;
+            position += bytesRead;
+        }
+        if (total > MAX_LOCAL_FILE_BYTES) {
+            throw new Error("Local document exceeds the configured byte limit.");
+        }
+        await verifyOpenedPath();
+        return {
+            buffer: Buffer.concat(chunks, total),
+            mtimeMs: opened.mtimeMs,
+            ctimeMs: opened.ctimeMs,
+            bytes: total,
+            dev: opened.dev,
+            ino: opened.ino,
+            mode: opened.mode,
+        };
+    }
+    finally {
+        await handle.close();
+    }
+}
 /** Split plain text into virtual pages: on form-feeds if present, else ~4 KB blocks. */
 function paginateText(s) {
     if (s.includes("\f")) {
-        return { pages: s.split("\f").map(cleanText), synthetic: false };
+        const pages = [];
+        let start = 0;
+        while (true) {
+            if (pages.length >= MAX_DOCUMENT_PAGES) {
+                throw new Error(`Document exceeds the ${MAX_DOCUMENT_PAGES.toLocaleString()}-page limit.`);
+            }
+            const end = s.indexOf("\f", start);
+            pages.push(cleanText(s.slice(start, end === -1 ? s.length : end)));
+            if (end === -1)
+                break;
+            start = end + 1;
+        }
+        return { pages, synthetic: false };
     }
     const TARGET = 4000;
     const pages = [];
-    let buf = "";
-    for (const line of s.split("\n")) {
-        if (buf.length > 0 && buf.length + line.length + 1 > TARGET) {
-            pages.push(buf);
-            buf = "";
+    let start = 0;
+    while (start < s.length) {
+        if (pages.length >= MAX_DOCUMENT_PAGES) {
+            throw new Error(`Document exceeds the ${MAX_DOCUMENT_PAGES.toLocaleString()}-page limit.`);
         }
-        buf += (buf ? "\n" : "") + line;
+        let end = Math.min(s.length, start + TARGET);
+        if (end < s.length) {
+            const newline = s.lastIndexOf("\n", end);
+            if (newline >= start)
+                end = newline + 1;
+        }
+        if (end <= start)
+            end = Math.min(s.length, start + TARGET);
+        pages.push(cleanText(s.slice(start, end)));
+        start = end;
     }
-    if (buf)
-        pages.push(buf);
-    return { pages: pages.length ? pages.map(cleanText) : [""], synthetic: true };
+    return { pages: pages.length ? pages : [""], synthetic: true };
 }
 /** Load + paginate a document, reusing the cache when the file is unchanged. */
-async function loadDoc(real) {
-    const st = await stat(real);
-    const cached = CACHE.get(real);
-    if (cached && cached.mtimeMs === st.mtimeMs)
-        return cached;
+async function loadDocOnce(real, permittedRoots) {
+    const release = await acquireLoadSlot();
+    try {
+        const st = await stat(real);
+        const cached = CACHE.get(real);
+        if (cached &&
+            cached.mtimeMs === st.mtimeMs &&
+            cached.ctimeMs === st.ctimeMs &&
+            cached.bytes === st.size &&
+            cached.dev === st.dev &&
+            cached.ino === st.ino &&
+            cached.mode === st.mode) {
+            return cached;
+        }
+        if (cached)
+            CACHE.delete(real);
+        const ext = extname(real).toLowerCase();
+        const opened = await readRegularFileLimited(real, permittedRoots);
+        const metadata = {
+            mtimeMs: opened.mtimeMs,
+            ctimeMs: opened.ctimeMs,
+            bytes: opened.bytes,
+            dev: opened.dev,
+            ino: opened.ino,
+            mode: opened.mode,
+        };
+        let doc;
+        if (ext === ".pdf") {
+            if (!opened.buffer.subarray(0, 1024).includes(Buffer.from("%PDF-"))) {
+                throw new Error("File has a .pdf extension but does not contain a PDF header.");
+            }
+            const extracted = await extractPdfSafely(opened.buffer, {
+                mergePages: false,
+                maxChars: MAX_EXTRACTED_CHARS,
+                maxPages: MAX_DOCUMENT_PAGES,
+            });
+            // mergePages:false keeps page boundaries so search/read can cite page numbers.
+            const pages = (extracted.pages ?? []).map(cleanText);
+            doc = { pages, kind: "pdf", synthetic: false, ...metadata };
+        }
+        else if (TEXT_EXTS.has(ext)) {
+            const s = opened.buffer.toString("utf8");
+            if (s.length > MAX_EXTRACTED_CHARS) {
+                throw new Error(`Document text exceeds the ${MAX_EXTRACTED_CHARS.toLocaleString()}-character limit.`);
+            }
+            const { pages, synthetic } = paginateText(s);
+            doc = { pages, kind: "text", synthetic, ...metadata };
+        }
+        else {
+            throw new Error(`Unsupported file type "${ext || "(none)"}" — this tool reads .pdf and plain-text files.`);
+        }
+        CACHE.set(real, doc);
+        return doc;
+    }
+    finally {
+        release();
+    }
+}
+export async function loadDoc(real, roots) {
     const ext = extname(real).toLowerCase();
-    let doc;
-    if (ext === ".pdf") {
-        const buf = await readFile(real);
-        const pdf = await getDocumentProxy(new Uint8Array(buf));
-        // mergePages:false keeps page boundaries so search/read can cite page numbers.
-        const extracted = await extractText(pdf, { mergePages: false });
-        const raw = extracted?.text;
-        const pages = (Array.isArray(raw) ? raw : [String(raw ?? "")]).map(cleanText);
-        doc = { pages, kind: "pdf", synthetic: false, mtimeMs: st.mtimeMs, bytes: st.size };
+    if (!ext || basename(real).startsWith(".")) {
+        throw new Error("Only explicit .pdf or supported plain-text file extensions are readable.");
     }
-    else if (TEXT_EXTS.has(ext)) {
-        const s = await readFile(real, "utf8");
-        const { pages, synthetic } = paginateText(s);
-        doc = { pages, kind: "text", synthetic, mtimeMs: st.mtimeMs, bytes: st.size };
+    const permittedRoots = roots ?? (await allowedRoots());
+    const canonical = await realpath(real);
+    await assertTrustedAllowedPath(canonical, permittedRoots);
+    const existing = inFlightLoads.get(canonical);
+    if (existing)
+        return await existing;
+    const pending = loadDocOnce(canonical, permittedRoots);
+    inFlightLoads.set(canonical, pending);
+    try {
+        return await pending;
     }
-    else {
-        throw new Error(`Unsupported file type "${ext || "(none)"}" — this tool reads .pdf and plain-text files.`);
+    finally {
+        if (inFlightLoads.get(canonical) === pending)
+            inFlightLoads.delete(canonical);
     }
-    CACHE.set(real, doc);
-    return doc;
 }
 function docChars(doc) {
     return doc.pages.reduce((n, p) => n + p.length, 0);
@@ -176,8 +506,16 @@ function looksLikeHeading(line) {
 function buildOutline(doc, max) {
     const out = [];
     let last = "";
+    let linesInspected = 0;
     for (let p = 0; p < doc.pages.length && out.length < max; p++) {
-        for (const line of doc.pages[p].split("\n")) {
+        const page = doc.pages[p];
+        let start = 0;
+        let pageLines = 0;
+        while (start <= page.length && pageLines < 20_000 && linesInspected < 200_000) {
+            const newline = page.indexOf("\n", start);
+            const line = page.slice(start, newline === -1 ? page.length : newline);
+            pageLines++;
+            linesInspected++;
             const t = line.trim();
             if (t && t !== last && looksLikeHeading(t)) {
                 out.push({ page: p + 1, text: t.replace(/^#{1,6}\s+/, "") });
@@ -185,7 +523,12 @@ function buildOutline(doc, max) {
                 if (out.length >= max)
                     break;
             }
+            if (newline === -1)
+                break;
+            start = newline + 1;
         }
+        if (linesInspected >= 200_000)
+            break;
     }
     return out;
 }
@@ -199,10 +542,10 @@ export function registerLocalTools(server) {
             "character count, an estimated token count, and a heuristic outline (detected " +
             "headings with their page numbers) — WITHOUT dumping the whole document into context. " +
             "Use this first on a long file, then local_doc_search to jump to relevant pages and " +
-            "local_doc_read to read a chunk. Only files under the allowed roots (home directory by " +
-            "default) can be opened.",
+            "local_doc_read to read a chunk. Local access is disabled until the server is started " +
+            "with explicit PHILOSOPHY_DOC_ROOTS.",
         inputSchema: {
-            path: z.string().min(1).describe("Absolute (or ~-relative) path to a local .pdf or text file."),
+            path: z.string().trim().min(1).max(4096).describe("Absolute path to a local .pdf or supported text file."),
             max_headings: z
                 .number()
                 .int()
@@ -213,8 +556,9 @@ export function registerLocalTools(server) {
         },
     }, async ({ path, max_headings }) => {
         try {
-            const real = await resolveAllowed(path);
-            const doc = await loadDoc(real);
+            const roots = await allowedRoots();
+            const real = await resolveAllowed(path, roots);
+            const doc = await loadDoc(real, roots);
             const chars = docChars(doc);
             const outline = buildOutline(doc, max_headings);
             const kindLabel = doc.kind === "pdf"
@@ -249,15 +593,18 @@ export function registerLocalTools(server) {
     });
     server.registerTool("local_doc_search", {
         title: "Search inside a local document",
-        description: "Search a local PDF or text file for a keyword or regular expression and return only the " +
+        description: "Search a local PDF or text file for a literal keyword or phrase and return only the " +
             "matching passages — each as a short snippet with surrounding context and its page number — " +
             "instead of the whole document. This is the token-efficient way to answer a question about " +
             "a long file: find the handful of relevant pages, then local_doc_read just those. Only files " +
             "under the allowed roots can be opened.",
         inputSchema: {
-            path: z.string().min(1).describe("Path to a local .pdf or text file."),
-            query: z.string().min(1).max(1000).describe("Keyword/phrase to find (or a regex if is_regex=true)."),
-            is_regex: z.boolean().default(false).describe("Treat query as a JavaScript regular expression."),
+            path: z.string().trim().min(1).max(4096).describe("Path to a local .pdf or text file."),
+            query: z.string().min(1).max(1000).describe("Literal keyword or phrase to find."),
+            is_regex: z
+                .boolean()
+                .default(false)
+                .describe("Deprecated. Regular-expression search is disabled to prevent denial of service."),
             ignore_case: z.boolean().default(true).describe("Case-insensitive matching (default true)."),
             context_chars: z
                 .number()
@@ -283,35 +630,44 @@ export function registerLocalTools(server) {
         },
     }, async ({ path, query, is_regex, ignore_case, context_chars, max_matches, max_chars }) => {
         try {
-            const real = await resolveAllowed(path);
-            const doc = await loadDoc(real);
-            const flags = ignore_case ? "gi" : "g";
-            let re;
-            try {
-                re = new RegExp(is_regex ? query : escapeRegex(query), flags);
+            if (is_regex) {
+                return fail("Regular-expression search is disabled because JavaScript regexes can block the MCP " +
+                    "process. Search for a literal keyword or phrase instead.");
             }
-            catch (e) {
-                return fail(`Invalid regular expression: ${e?.message ?? e}`);
-            }
+            const roots = await allowedRoots();
+            const real = await resolveAllowed(path, roots);
+            const doc = await loadDoc(real, roots);
             // Collect a bit beyond the display cap so we can tell the user there's more.
             const hardCap = max_matches * 3;
             const hits = [];
             let truncatedCollection = false;
             outer: for (let p = 0; p < doc.pages.length; p++) {
                 const text = doc.pages[p];
-                re.lastIndex = 0;
-                let m;
+                const matcher = ignore_case ? caseInsensitiveLiteral(query) : undefined;
+                let position = 0;
                 let perPage = 0;
-                while ((m = re.exec(text)) !== null) {
-                    const len = m[0].length || 1;
-                    const start = Math.max(0, m.index - context_chars);
-                    const end = Math.min(text.length, m.index + len + context_chars);
+                while (position <= text.length) {
+                    let matchAt;
+                    let matchLength;
+                    if (matcher) {
+                        matcher.lastIndex = position;
+                        const match = matcher.exec(text);
+                        matchAt = match?.index ?? -1;
+                        matchLength = match?.[0].length ?? 0;
+                    }
+                    else {
+                        matchAt = text.indexOf(query, position);
+                        matchLength = query.length;
+                    }
+                    if (matchAt === -1)
+                        break;
+                    const start = Math.max(0, matchAt - context_chars);
+                    const end = Math.min(text.length, matchAt + matchLength + context_chars);
                     const snippet = (start > 0 ? "…" : "") +
                         text.slice(start, end).replace(/\s+/g, " ").trim() +
                         (end < text.length ? "…" : "");
                     hits.push({ page: p + 1, snippet });
-                    if (m[0].length === 0)
-                        re.lastIndex++; // guard against zero-width loops
+                    position = matchAt + Math.max(1, matchLength);
                     if (++perPage >= 50)
                         break; // don't let one page dominate
                     if (hits.length >= hardCap) {
@@ -321,7 +677,7 @@ export function registerLocalTools(server) {
                 }
             }
             if (hits.length === 0) {
-                return ok(`No matches for ${is_regex ? `/${query}/` : `"${query}"`} in ${basename(real)}.`);
+                return ok(`No matches for "${query}" in ${basename(real)}.`);
             }
             const shown = [];
             let budget = max_chars;
@@ -338,7 +694,8 @@ export function registerLocalTools(server) {
             const more = truncatedCollection || hits.length > shown.length || cutByChars
                 ? " (more matches exist — refine the query or read the cited pages)"
                 : "";
-            const header = `${hits.length}${truncatedCollection ? "+" : ""} match(es) for ${is_regex ? `/${query}/` : `"${query}"`} in ${basename(real)}; showing ${shown.length}${more}.`;
+            const header = `${hits.length}${truncatedCollection ? "+" : ""} match(es) for "${query}" ` +
+                `in ${basename(real)}; showing ${shown.length}${more}.`;
             return ok([header, "", ...shown].join("\n"));
         }
         catch (e) {
@@ -353,17 +710,19 @@ export function registerLocalTools(server) {
             "which makes it easy to walk a long document chunk-by-chunk (e.g. to summarize it section by " +
             "section). Only files under the allowed roots can be opened.",
         inputSchema: {
-            path: z.string().min(1).describe("Path to a local .pdf or text file."),
+            path: z.string().trim().min(1).max(4096).describe("Path to a local .pdf or text file."),
             page_from: z
                 .number()
                 .int()
                 .min(1)
+                .max(MAX_DOCUMENT_PAGES)
                 .default(1)
                 .describe("First page to read (1-based, default 1)."),
             page_to: z
                 .number()
                 .int()
                 .min(1)
+                .max(MAX_DOCUMENT_PAGES)
                 .optional()
                 .describe("Last page to read (1-based, inclusive). Omit to read forward until max_chars."),
             max_chars: z
@@ -376,8 +735,9 @@ export function registerLocalTools(server) {
         },
     }, async ({ path, page_from, page_to, max_chars }) => {
         try {
-            const real = await resolveAllowed(path);
-            const doc = await loadDoc(real);
+            const roots = await allowedRoots();
+            const real = await resolveAllowed(path, roots);
+            const doc = await loadDoc(real, roots);
             const total = doc.pages.length;
             if (page_from > total) {
                 return fail(`page_from ${page_from} is past the end (document has ${total} page(s)).`);

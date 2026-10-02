@@ -70,31 +70,69 @@ export function renderWindow(header: string, fullText: string, maxChars: number,
 }
 
 /**
- * Tiny bounded LRU cache for fully-extracted bodies, keyed by source id/URL.
- * Count-bounded (not byte-bounded) — a handful of books is plenty for paging
- * through one work at a time, and keeps the footprint of a local server small.
+ * Tiny entry- and weight-bounded LRU cache for fully-extracted bodies, keyed
+ * by source id/URL. Callers normally use encoded bytes as the weight.
  */
 export class LruCache<V> {
-  private map = new Map<string, V>();
-  constructor(private readonly max = 8) {}
+  private map = new Map<string, { value: V; weight: number }>();
+  private totalWeight = 0;
+
+  constructor(
+    private readonly maxEntries = 8,
+    private readonly maxWeight = Number.POSITIVE_INFINITY,
+    private readonly weigh: (value: V) => number = () => 1,
+  ) {
+    if (!Number.isInteger(maxEntries) || maxEntries < 1) {
+      throw new Error("LruCache maxEntries must be a positive integer.");
+    }
+    if (!(maxWeight > 0)) {
+      throw new Error("LruCache maxWeight must be positive.");
+    }
+  }
 
   get(key: string): V | undefined {
-    const v = this.map.get(key);
-    if (v !== undefined) {
+    const entry = this.map.get(key);
+    if (entry !== undefined) {
       // Refresh recency.
       this.map.delete(key);
-      this.map.set(key, v);
+      this.map.set(key, entry);
     }
-    return v;
+    return entry?.value;
   }
 
   set(key: string, val: V): void {
-    if (this.map.has(key)) this.map.delete(key);
-    this.map.set(key, val);
-    while (this.map.size > this.max) {
+    const old = this.map.get(key);
+    if (old) {
+      this.totalWeight -= old.weight;
+      this.map.delete(key);
+    }
+
+    const rawWeight = this.weigh(val);
+    const weight = Number.isFinite(rawWeight) ? Math.max(0, rawWeight) : this.maxWeight + 1;
+    if (weight > this.maxWeight) return;
+
+    this.map.set(key, { value: val, weight });
+    this.totalWeight += weight;
+    while (this.map.size > this.maxEntries || this.totalWeight > this.maxWeight) {
       const oldest = this.map.keys().next().value;
       if (oldest === undefined) break;
+      this.totalWeight -= this.map.get(oldest)?.weight ?? 0;
       this.map.delete(oldest);
     }
+  }
+
+  delete(key: string): boolean {
+    const entry = this.map.get(key);
+    if (!entry) return false;
+    this.totalWeight -= entry.weight;
+    return this.map.delete(key);
+  }
+
+  get size(): number {
+    return this.map.size;
+  }
+
+  get weight(): number {
+    return this.totalWeight;
   }
 }

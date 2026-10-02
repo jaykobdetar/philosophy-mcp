@@ -1,6 +1,6 @@
 {
   "name": "philosophy-mcp",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "MCP server for philosophy texts — PhilPapers/PhilArchive scholarship plus public-domain classics (Project Gutenberg, Internet Archive, Wikisource), open-access books (DOAB), modern editions (Open Library), and the Stanford Encyclopedia of Philosophy. No API key required.",
   "type": "module",
   "bin": {
@@ -9,17 +9,20 @@
   },
   "main": "dist/index.js",
   "files": [
-    "dist"
+    "dist",
+    "npm-shrinkwrap.json"
   ],
   "scripts": {
-    "build": "tsc && chmod +x dist/index.js",
+    "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc && node --input-type=module -e \"import { chmodSync } from 'node:fs'; chmodSync('dist/index.js', 0o755)\"",
     "start": "node dist/index.js",
-    "test": "npm run build && node smoke-test.mjs",
+    "test": "npm run build && node --test --test-concurrency=1 test/*.test.mjs && node smoke-test.mjs",
+    "test:security": "npm run build && node --test --test-concurrency=1 test/*.test.mjs",
     "smoke": "node smoke-test.mjs",
     "prepare": "npm run build"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "keywords": [
     "mcp",
@@ -46,13 +49,13 @@
   },
   "homepage": "https://github.com/sea9401/philosophy-mcp#readme",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "fast-xml-parser": "^5.8.0",
-    "unpdf": "^1.6.2",
-    "zod": "^4.4.3"
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "fast-xml-parser": "5.8.0",
+    "unpdf": "1.6.2",
+    "zod": "4.4.3"
   },
   "devDependencies": {
-    "@types/node": "^20.19.41",
-    "typescript": "^5.9.3"
+    "@types/node": "20.19.41",
+    "typescript": "5.9.3"
   }
 }

@@ -1,6 +1,5 @@
 # philosophy-mcp
 
-[![CI](https://github.com/sea9401/philosophy-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/sea9401/philosophy-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 An MCP server for **philosophy texts** — both current scholarship and the canon.
@@ -10,8 +9,8 @@ It folds these into one keyless server:
   analog to arXiv): search papers, read abstracts, browse recent submissions, pull full text.
 - **Books, classics & reference** — public-domain originals and translations (Project
   Gutenberg, Internet Archive, Wikisource), open-access academic books (DOAB), modern
-  editions (Open Library), and the Stanford Encyclopedia of Philosophy — plus a generic
-  `fetch_text` for any other source (Zeno.org, marxists.org, Standard Ebooks, …).
+  editions (Open Library), and the Stanford Encyclopedia of Philosophy. The generic
+  `fetch_text` tool is available only for explicitly allowlisted hosts.
 - **Local documents** — open a large local PDF or text file and work it without loading the
   whole thing into context: outline, in-file search, and paged reading.
 
@@ -46,7 +45,7 @@ such as `BROTNO-9` resolves on both `philarchive.org` and `philpapers.org`.
 | `search_openlibrary` | Modern editions & translations as metadata, with read/borrow links | Open Library |
 | `search_doab` | Peer-reviewed, fully open-access academic books (readable in full) | DOAB |
 | `search_sep` / `get_sep_entry` | Search and read the standard scholarly reference | Stanford Encyclopedia of Philosophy |
-| `fetch_text` | Readable plain text from **any** URL — the catch-all for sources without a dedicated tool | any site |
+| `fetch_text` | Readable text from an exact hostname configured in `PHILOSOPHY_FETCH_HOSTS`; disabled by default | explicitly allowed sites |
 
 All text-returning tools (`get_fulltext`, the `get_*_text` readers, `get_sep_entry`,
 `fetch_text`) return **one window** — `max_chars` characters (default 15000) starting at
@@ -60,13 +59,15 @@ paging doesn't re-download or re-parse the source.
 | Tool | What it does |
 | --- | --- |
 | `local_doc_info` | Overview of a local PDF/text file — pages, characters, ~tokens, and a heuristic outline — without loading the whole file |
-| `local_doc_search` | Find passages by keyword/regex and return just the matching snippets with page numbers |
+| `local_doc_search` | Find literal keywords or phrases and return just the matching snippets with page numbers |
 | `local_doc_read` | Read a bounded page range / chunk, capped at `max_chars` so it can't flood context, reporting the next page to continue from |
 
 These read a large local file the way you'd skim a thick book — get an outline, jump to the
 relevant pages by searching, then read a chunk at a time — so only the parts that matter reach
-the context. Only files under `$HOME` are readable by default; add more roots via
-`PHILOSOPHY_DOC_ROOTS`.
+the context. Local access is disabled by default. Enable it with `PHILOSOPHY_DOC_ROOTS`, pointing
+only at dedicated document directories. The server never adds `$HOME` implicitly, rejects hidden
+and extensionless files, resolves symlinks before checking containment, and applies file-size and
+PDF-extraction limits.
 
 ## Example
 
@@ -86,52 +87,42 @@ Then `get_fulltext` with `{ "id": "BROTNO-9" }` returns the paper's extracted fu
 
 For the canon: `search_gutenberg` with `{ "query": "kant critique", "languages": "en" }` returns book
 ids, and `get_gutenberg_text` with `{ "book_id": 4280 }` reads *The Critique of Pure Reason* directly;
-`search_sep` → `get_sep_entry` reads an encyclopedia entry; `fetch_text` pulls readable text from
-German originals on Zeno.org or translations on marxists.org.
+`search_sep` → `get_sep_entry` reads an encyclopedia entry. After explicitly allowing a hostname,
+`fetch_text` can read a source without a dedicated tool.
 
 > 20th-century authors still in copyright (Heidegger, Adorno, Gadamer, Habermas) won't have free
 > full texts here — you'll get metadata, SEP coverage, and read/borrow links.
 
 ## Setup
 
-Run straight with `npx` (no clone, once published):
+Use Node 22 or newer and install from this reviewed checkout. Do not replace it with an
+unreviewed copy of the upstream repository:
 
 ```bash
-npx -y philosophy-mcp
-```
-
-Or from source:
-
-```bash
-git clone https://github.com/sea9401/philosophy-mcp
 cd philosophy-mcp
-npm install   # the `prepare` hook builds dist/ automatically
+npm ci --ignore-scripts
+npm run build
 ```
 
 ### Updating
 
-`dist/` is committed, so an existing source checkout updates with a plain pull — no build step:
-
-```bash
-cd philosophy-mcp
-git pull
-```
-
-Then **restart the MCP server** (reconnect in Claude Code, or restart Claude Desktop) so it
-loads the new build. Maintainers: rebuild and commit `dist/` whenever you change `src/` — CI
-fails if the two drift.
+Upstream changes may alter the security boundaries described below. Review and test them before
+merging them into this hardened branch. After any update, rebuild and **restart the MCP server**
+(reconnect in Claude Code, or restart Claude Desktop) so it loads the new build. Maintainers:
+rebuild and commit `dist/` whenever `src/` changes — CI fails if the two drift.
 
 ## Register with Claude Code
 
 ```bash
-# via npx (no clone)
-claude mcp add philosophy -- npx -y philosophy-mcp
+claude mcp add philosophy -- node /absolute/path/to/philosophy-mcp/dist/index.js
+```
 
-# from a local build
-claude mcp add philosophy -- node /absolute/path/to/dist/index.js
+To enable local documents, point the server at a dedicated directory rather than your home folder:
 
-# optional: identify yourself to OpenAlex's "polite pool" for better rate limits
-claude mcp add philosophy -e OPENALEX_MAILTO=you@example.com -- npx -y philosophy-mcp
+```bash
+claude mcp add philosophy \
+  -e PHILOSOPHY_DOC_ROOTS=/absolute/path/to/philosophy-documents \
+  -- node /absolute/path/to/philosophy-mcp/dist/index.js
 ```
 
 Then `/mcp` inside Claude Code lists `philosophy` with its tools.
@@ -145,8 +136,11 @@ Add to `claude_desktop_config.json`:
   "mcpServers": {
     "philosophy": {
       "command": "node",
-      "args": ["/home/sea9401/philpapers-mcp/dist/index.js"],
-      "env": { "OPENALEX_MAILTO": "you@example.com" }
+      "args": ["/absolute/path/to/philosophy-mcp/dist/index.js"],
+      "env": {
+        "OPENALEX_MAILTO": "you@example.com",
+        "PHILOSOPHY_DOC_ROOTS": "/absolute/path/to/philosophy-documents"
+      }
     }
   }
 }
@@ -156,19 +150,71 @@ Add to `claude_desktop_config.json`:
 
 | Var | Default | Purpose |
 | --- | --- | --- |
-| `OPENALEX_MAILTO` | `mcp@example.com` | Your email — joins OpenAlex's polite pool (recommended). |
-| `PHILPAPERS_DOWNLOAD_DIR` | `<tmp>/philpapers-mcp` | Where `fetch_pdf` saves files. |
-| `PHILOSOPHY_DOC_ROOTS` | `$HOME` | Extra roots the `local_doc_*` tools may read (delimiter-separated absolute paths). |
+| `OPENALEX_API_KEY` | unset; anonymous access | Optional OpenAlex bearer credential for a higher request budget. It is sent only in the Authorization header and must be treated as a secret. |
+| `OPENALEX_MAILTO` | project repository URL | Optional operator contact included in the OpenAlex User-Agent. It no longer changes OpenAlex request limits. |
+| `PHILOSOPHY_CONTACT` | `OPENALEX_MAILTO`, then project repository URL | Operator email or URL included in book/reference request identification. An email is recommended for regular Open Library use. |
+| `PHILPAPERS_DOWNLOAD_DIR` | private per-user directory under OS temp | Persistent, quota-managed directory where `fetch_pdf` saves 0600 files; it is not automatically cleaned between runs. If set, it must be absolute, owned by the current user, and mode 0700. |
+| `PHILPAPERS_MAX_PDF_BYTES` | `33554432` | Maximum downloaded PDF size. |
+| `PHILPAPERS_MAX_DOWNLOAD_TOTAL_BYTES` | `536870912` | Aggregate quota for generated PDF and in-progress download files. |
+| `PHILPAPERS_MAX_DOWNLOAD_FILES` | `64` | Aggregate generated-file count, including in-progress files. |
+| `PHILPAPERS_MAX_PENDING_DOWNLOADS` | `4` | Maximum active/queued PDF publications; excess calls fail fast. |
+| `PHILOSOPHY_DOC_ROOTS` | unset; local access disabled | Delimiter-separated absolute document directories. These replace the old implicit-home behavior. |
+| `PHILOSOPHY_FETCH_HOSTS` | unset; `fetch_text` disabled | Comma-separated exact public hostnames that `fetch_text` may contact. |
+| `PHILOSOPHY_MAX_LOCAL_FILE_BYTES` | `33554432` | Maximum local document size. |
+| `PHILOSOPHY_MAX_EXTRACTED_CHARS` | `20000000` | Maximum extracted characters from one local PDF/text document. |
+| `PHILOSOPHY_MAX_DOCUMENT_PAGES` | `20000` | Maximum pages or form-feed-delimited text sections in a local document. |
+| `PHILOSOPHY_MAX_LOCAL_CACHE_BYTES` | `67108864` | Maximum local-document cache weight. |
+| `PHILOSOPHY_MAX_REMOTE_TEXT_BYTES` | `33554432` | Maximum body size for dedicated book/reference readers. |
+| `PHILOSOPHY_MAX_GENERIC_FETCH_BYTES` | `8388608` | Maximum body size for `fetch_text`. |
+| `PHILOSOPHY_MAX_REMOTE_CACHE_BYTES` | `67108864` | Maximum remote-text cache weight. |
+| `PHILOSOPHY_MAX_PDF_WORKERS` | `1` | Maximum simultaneous isolated PDF parser processes (range 1–4). |
+| `PHILOSOPHY_MAX_PDF_QUEUE` | `4` | Maximum queued PDF extractions; excess calls fail fast. |
+| `PHILOSOPHY_MAX_PDF_PAGES` | `10000` | Default page limit enforced inside the PDF parser process. |
+
+## Security boundaries
+
+- Every outbound connection resolves and validates public IP addresses once, then pins the socket
+  to those checked addresses. Redirects are followed manually and revalidated on every hop.
+- Dedicated tools enforce exact service hostnames. HTTPS downgrades, URL credentials, private/LAN
+  addresses, special-use IP ranges, unsafe ports, and mixed public/private DNS answers are rejected.
+- Remote and local bodies have byte limits. PDF parsing runs in a separate heap-limited process;
+  metadata parsing runs in a heap-limited worker. Both have wall timeouts and bounded admission
+  queues, and PDFs also have a page cap. Caches are
+  bounded by entry count and bytes.
+- Local documents are opt-in and restricted to explicit roots. JavaScript regular-expression search
+  is disabled; `local_doc_search` performs literal matching. On Linux, the opened descriptor itself
+  is checked through `/proc/self/fd` to close intermediate-symlink races.
+- `fetch_pdf` writes through an exclusive 0600 temporary file into a private directory, then
+  publishes a unique filename atomically. All writes stay anchored to an opened directory descriptor;
+  platforms without a usable descriptor filesystem fail closed. Aggregate file/byte quotas and a
+  bounded publication queue prevent repeated calls from filling storage or retaining unlimited PDF buffers.
+- JSON-RPC input lines, tool input strings, tool outputs, concurrent network requests, local loads,
+  and generated-document page counts all have explicit bounds.
+- Direct dependency versions are exact and the published package includes `npm-shrinkwrap.json`, so
+  installs use the reviewed transitive dependency graph rather than floating to newer releases.
+
+Retrieved pages, OCR, PDFs, and local documents remain **untrusted content**: they can contain text
+that attempts to influence an AI client. Keep tool approvals enabled for consequential actions and
+run the server with a dedicated low-privilege account or sandbox when handling adversarial files.
+For hostile PDFs, also apply an OS/container memory limit: the parser subprocess has a V8 heap
+limit and wall timeout, but those do not hard-cap every native or typed-array allocation. MCP
+cancellation is handled conservatively, so canceled work may retain a bounded slot until its own
+deadline or until the client reconnects.
+On non-Linux POSIX systems, local-file validation combines trusted path-component checks with
+repeated canonical-path and inode checks because Node does not expose Linux's descriptor path.
+Windows local-document access and PDF publication fail closed because Node cannot enforce the
+required ownership, permission, and descriptor-relative path guarantees there.
 
 ## Smoke test
 
 ```bash
-npm test   # builds, then runs smoke-test.mjs
+npm test
 ```
 
-`smoke-test.mjs` spawns the server over stdio, performs the MCP handshake, and verifies every
-expected tool is registered — no network calls, so it's the regression guard CI runs. (The
-older `node test-client.mjs` additionally exercises a couple of live PhilPapers calls.)
+The test command rebuilds committed `dist/`, runs focused network, filesystem, download, cache,
+PDF-parser, prompt-boundary, and MCP integration regressions, then runs `smoke-test.mjs`. The tests
+do not require live network access. The older `node test-client.mjs` exercises a smaller set of live
+source calls.
 
 ## Notes & limits
 
@@ -185,16 +231,19 @@ older `node test-client.mjs` additionally exercises a couple of live PhilPapers 
 
 ## Publishing (maintainers)
 
-CI (`.github/workflows/ci.yml`) builds on Node 18/20/22 for every push and PR.
+CI (`.github/workflows/ci.yml`) builds on Node 22/24 for every push and PR.
 
 To publish a new version to npm:
 
-1. Add a repo secret `NPM_TOKEN` (an npm **Automation** access token) under
-   *Settings → Secrets and variables → Actions*.
+1. In the package settings on npmjs.com, configure `.github/workflows/publish.yml` from this
+   repository as a **Trusted Publisher** allowed to run `npm publish`. The workflow uses OIDC and
+   does not require a long-lived npm token. The package owner must perform an initial manual publish
+   before configuring this relationship if the package does not exist yet.
 2. Bump the version and tag: `npm version patch && git push --follow-tags`.
 3. Cut a GitHub Release — `.github/workflows/publish.yml` runs `npm publish` automatically.
 
-Or publish manually: `npm login` then `npm publish --access public`.
+For an initial manual publish, use `npm login` or a narrowly scoped granular access token, then run
+`npm publish --access public`.
 
 ## License
 

@@ -11,32 +11,69 @@
  *   - Open Library       (modern editions/translations metadata + read/borrow links)
  *   - DOAB               (open-access academic books)
  *   - Stanford Encyclopedia of Philosophy (static contents index + entry text)
- *   - fetch_text         (readable text from any URL — Zeno.org, marxists.org, ...)
+ *   - fetch_text         (readable text from explicitly allowlisted public hosts)
  */
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { XMLParser } from "fast-xml-parser";
 import { z } from "zod";
-import { lookup } from "node:dns/promises";
-import { isIP } from "node:net";
 import { LruCache, renderWindow } from "./textwindow.js";
+import {
+  headerValue,
+  hostAllowlistPolicy,
+  NetworkSecurityError,
+  ResponseTooLargeError,
+  secureRequest,
+  type UrlPolicy,
+} from "./net.js";
+import { parseJsonSafely, parseXmlSafely } from "./xml.js";
 
 // ---------------------------------------------------------------------------
 // HTTP + text helpers
 // ---------------------------------------------------------------------------
 
-// A browser-like UA maximises compatibility — several scholarly sites reject
-// unfamiliar agents with 403.
-const BOOK_UA = "Mozilla/5.0 (compatible; philosophy-mcp/0.3; +research/educational)";
+// Identify the client honestly and provide operator contact when configured,
+// as requested by Wikimedia, Internet Archive, and Open Library API policies.
+const configuredBookContact = (
+  process.env.PHILOSOPHY_CONTACT ?? process.env.OPENALEX_MAILTO ?? ""
+).trim();
+const BOOK_CONTACT = /^[A-Za-z0-9][A-Za-z0-9@.:/_+?&=%#~-]{2,253}$/.test(
+  configuredBookContact,
+)
+  ? configuredBookContact
+  : "https://github.com/sea9401/philosophy-mcp";
+const BOOK_UA = `philosophy-mcp/0.5 (MCP research client; contact: ${BOOK_CONTACT})`;
 const TIMEOUT_MS = 30_000;
+const MAX_REMOTE_METADATA_BYTES = 2 * 1024 * 1024;
 const RETRY_STATUS = new Set([429, 500, 502, 503, 504]);
 
-const atomXml = new XMLParser({
-  ignoreAttributes: false,
-  attributeNamePrefix: "@_",
-  removeNSPrefix: true,
-  trimValues: true,
-});
+function envByteLimit(name: string, fallback: number, minimum: number, maximum: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw new Error(`${name} must be an integer between ${minimum} and ${maximum} bytes.`);
+  }
+  return parsed;
+}
+
+const MAX_REMOTE_TEXT_BYTES = envByteLimit(
+  "PHILOSOPHY_MAX_REMOTE_TEXT_BYTES",
+  32 * 1024 * 1024,
+  64 * 1024,
+  256 * 1024 * 1024,
+);
+const MAX_GENERIC_FETCH_BYTES = envByteLimit(
+  "PHILOSOPHY_MAX_GENERIC_FETCH_BYTES",
+  8 * 1024 * 1024,
+  64 * 1024,
+  64 * 1024 * 1024,
+);
+const MAX_BODY_CACHE_BYTES = envByteLimit(
+  "PHILOSOPHY_MAX_REMOTE_CACHE_BYTES",
+  64 * 1024 * 1024,
+  64 * 1024,
+  512 * 1024 * 1024,
+);
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -45,107 +82,45 @@ function asArr<T>(v: T | T[] | undefined | null): T[] {
   return Array.isArray(v) ? v : [v];
 }
 
-// ---------------------------------------------------------------------------
-// SSRF guard — used by the arbitrary-URL fetch_text tool
-// ---------------------------------------------------------------------------
-
-/** Block an IPv4 literal that is loopback, private, link-local (incl. the
- *  169.254.169.254 cloud-metadata endpoint), CGNAT, or otherwise non-public. */
-function isBlockedIp4(ip: string): boolean {
-  const p = ip.split(".").map((n) => Number(n));
-  if (p.length !== 4 || p.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true;
-  const [a, b, c] = p;
-  if (a === 0) return true; // 0.0.0.0/8 "this host"
-  if (a === 10) return true; // 10/8 private
-  if (a === 127) return true; // loopback
-  if (a === 169 && b === 254) return true; // link-local incl. cloud metadata
-  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16/12 private
-  if (a === 192 && b === 168) return true; // 192.168/16 private
-  if (a === 100 && b >= 64 && b <= 127) return true; // 100.64/10 CGNAT
-  if (a === 192 && b === 0 && c === 0) return true; // 192.0.0/24
-  if (a === 198 && (b === 18 || b === 19)) return true; // 198.18/15 benchmarking
-  if (a >= 224) return true; // 224/4 multicast + 240/4 reserved
-  return false;
-}
-
-/** Block an IPv6 literal that is loopback, ULA, link-local, or an embedded
- *  IPv4-mapped private address. */
-function isBlockedIp6(ip: string): boolean {
-  let s = ip.toLowerCase();
-  const pct = s.indexOf("%"); // strip zone id, e.g. fe80::1%eth0
-  if (pct !== -1) s = s.slice(0, pct);
-  if (s === "::1" || s === "::") return true; // loopback / unspecified
-  const mapped = s.match(/(?:::ffff:)(\d+\.\d+\.\d+\.\d+)$/); // ::ffff:1.2.3.4
-  if (mapped) return isBlockedIp4(mapped[1]);
-  const head = s.split(":")[0] ?? "";
-  if (/^fe[89ab]/.test(head)) return true; // fe80::/10 link-local
-  if (/^f[cd]/.test(head)) return true; // fc00::/7 unique-local
-  return false;
-}
-
-function isBlockedIp(ip: string): boolean {
-  const v = isIP(ip);
-  if (v === 4) return isBlockedIp4(ip);
-  if (v === 6) return isBlockedIp6(ip);
-  return true; // not a parseable IP → block
-}
-
-/**
- * Reject anything that isn't a plain http(s) request to a public host, to reduce
- * SSRF risk in fetch_text (which takes an arbitrary client URL). Blocks non-http
- * schemes, localhost, and hosts that resolve to private/loopback/link-local/
- * metadata addresses. A DNS lookup could still rebind between this check and the
- * actual connection (a small TOCTOU window), but this closes the common direct
- * vectors, and bookRequest re-runs the guard on every redirect hop.
- */
-async function assertPublicUrl(raw: string): Promise<void> {
-  let u: URL;
-  try {
-    u = new URL(raw);
-  } catch {
-    throw new Error(`Invalid URL: ${raw}`);
-  }
-  if (u.protocol !== "http:" && u.protocol !== "https:") {
-    throw new Error(`Only http(s) URLs are allowed (got "${u.protocol}").`);
-  }
-  const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-  if (!host) throw new Error(`URL has no host: ${raw}`);
-  if (host === "localhost" || host.endsWith(".localhost")) {
-    throw new Error(`Refusing to fetch localhost.`);
-  }
-  if (isIP(host)) {
-    if (isBlockedIp(host)) throw new Error(`Refusing to fetch private/loopback address ${host}.`);
-    return;
-  }
-  let addrs: Array<{ address: string }>;
-  try {
-    addrs = await lookup(host, { all: true });
-  } catch {
-    throw new Error(`Could not resolve host "${host}".`);
-  }
-  for (const { address } of addrs) {
-    if (isBlockedIp(address)) {
-      throw new Error(`Refusing to fetch "${host}" — it resolves to non-public address ${address}.`);
-    }
-  }
-}
-
 function ok(text: string) {
-  return { content: [{ type: "text" as const, text }] };
+  const bounded =
+    text.length <= 250_000
+      ? text
+      : `${text.slice(0, 250_000)}\n\n[output truncated at 250,000 characters]`;
+  return { content: [{ type: "text" as const, text: bounded }] };
 }
 function fail(text: string) {
-  return { content: [{ type: "text" as const, text }], isError: true };
+  const bounded = text.length <= 16_000 ? text : `${text.slice(0, 16_000)}…`;
+  return { content: [{ type: "text" as const, text: bounded }], isError: true };
+}
+
+function errorSummary(error: unknown): string {
+  return String((error as any)?.message ?? error).replace(/\s+/g, " ").slice(0, 1000);
+}
+
+class HttpResponseError extends Error {}
+
+function retryAfterMs(headers: Record<string, string | string[] | undefined>): number | undefined {
+  const raw = headerValue(headers, "retry-after").trim();
+  if (!raw) return undefined;
+  if (/^\d+$/.test(raw)) {
+    const milliseconds = Number(raw) * 1000;
+    return Number.isFinite(milliseconds)
+      ? Math.min(milliseconds, Number.MAX_SAFE_INTEGER)
+      : Number.MAX_SAFE_INTEGER;
+  }
+  const date = Date.parse(raw);
+  return Number.isFinite(date)
+    ? Math.min(Math.max(0, date - Date.now()), Number.MAX_SAFE_INTEGER)
+    : undefined;
 }
 
 interface FetchOpts {
   retries?: number;
   timeoutMs?: number;
-  /**
-   * Optional per-URL guard (e.g. an SSRF check). When set, redirects are followed
-   * manually so the guard runs on every hop instead of trusting the platform to
-   * follow a redirect into a private address.
-   */
-  guard?: (url: string) => Promise<void>;
+  maxBytes?: number;
+  urlPolicy?: UrlPolicy;
+  headers?: Record<string, string>;
 }
 
 interface FetchResult {
@@ -161,48 +136,57 @@ interface FetchResult {
 async function bookRequest(url: string, opts: FetchOpts = {}): Promise<FetchResult> {
   const retries = opts.retries ?? 2;
   const timeoutMs = opts.timeoutMs ?? TIMEOUT_MS;
-  const guard = opts.guard;
-  const MAX_HOPS = 5;
+  const deadline = Date.now() + timeoutMs;
   let lastErr: unknown;
   for (let i = 0; i <= retries; i++) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-      // When guarded, follow redirects by hand so the guard runs on every hop.
-      let current = url;
-      let res: Response;
-      for (let hop = 0; ; hop++) {
-        if (guard) await guard(current);
-        res = await fetch(current, {
-          signal: ctrl.signal,
-          redirect: guard ? "manual" : "follow",
-          headers: { "User-Agent": BOOK_UA, "Accept-Language": "en,de,ko" },
-        });
-        const location = res.headers.get("location");
-        if (guard && res.status >= 300 && res.status < 400 && location) {
-          if (hop >= MAX_HOPS) throw new Error(`Too many redirects from ${url}`);
-          current = new URL(location, current).toString();
-          continue;
-        }
-        break;
-      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error(`Request timed out after ${timeoutMs} ms.`);
+      const res = await secureRequest(url, {
+        maxBytes: opts.maxBytes ?? MAX_REMOTE_TEXT_BYTES,
+        timeoutMs: remaining,
+        headers: {
+          "User-Agent": BOOK_UA,
+          "Accept-Language": "en,de,ko",
+          ...opts.headers,
+        },
+        urlPolicy: opts.urlPolicy,
+      });
       if (RETRY_STATUS.has(res.status) && i < retries) {
         lastErr = new Error(`HTTP ${res.status}`);
-        await sleep(600 * (i + 1));
+        const remaining = Math.max(0, deadline - Date.now());
+        const requestedDelay = retryAfterMs(res.headers) ?? 600 * (i + 1);
+        if (requestedDelay >= remaining) {
+          throw new HttpResponseError(
+            `HTTP ${res.status} ${res.statusText} — retry delay exceeds this request's deadline.`,
+          );
+        }
+        const delay = Math.min(requestedDelay, remaining);
+        if (delay > 0) await sleep(delay);
         continue;
       }
-      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} — ${url}`);
-      const body = await res.text(); // read while the abort timer is still armed
-      return { contentType: (res.headers.get("content-type") || "").toLowerCase(), body };
+      if (res.status < 200 || res.status >= 300) {
+        throw new HttpResponseError(`HTTP ${res.status} ${res.statusText} — ${url}`);
+      }
+      return {
+        contentType: headerValue(res.headers, "content-type").toLowerCase(),
+        body: res.body.toString("utf8"),
+      };
     } catch (e) {
       lastErr = e;
-      if (i < retries) {
-        await sleep(600 * (i + 1));
+      if (
+        e instanceof NetworkSecurityError ||
+        e instanceof ResponseTooLargeError ||
+        e instanceof HttpResponseError
+      ) {
+        throw e;
+      }
+      if (i < retries && Date.now() < deadline) {
+        const delay = Math.min(600 * (i + 1), Math.max(0, deadline - Date.now()));
+        if (delay > 0) await sleep(delay);
         continue;
       }
       throw e;
-    } finally {
-      clearTimeout(timer);
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
@@ -212,12 +196,33 @@ async function getText(url: string, opts: FetchOpts = {}): Promise<string> {
   return (await bookRequest(url, opts)).body;
 }
 async function getJson(url: string, opts: FetchOpts = {}): Promise<any> {
-  return JSON.parse((await bookRequest(url, opts)).body);
+  const body = (
+    await bookRequest(url, {
+      ...opts,
+      headers: { ...opts.headers, Accept: "application/json" },
+    })
+  ).body;
+  const maxInputBytes = Math.min(opts.maxBytes ?? MAX_REMOTE_METADATA_BYTES, 16 * 1024 * 1024);
+  return await parseJsonSafely(body, {
+    maxInputBytes,
+    maxOutputBytes: Math.min(16 * 1024 * 1024, Math.max(1024, maxInputBytes * 2)),
+  });
 }
 
 // Gutendex (gutendex.com) is frequently overloaded; probe it fast and fall back
 // to the reliable gutenberg.org host rather than hanging on its timeout.
-const GUTENDEX_OPTS: FetchOpts = { retries: 0, timeoutMs: 8_000 };
+const GUTENDEX_POLICY = hostAllowlistPolicy(["gutendex.com"]);
+const GUTENBERG_POLICY = hostAllowlistPolicy(["gutenberg.org"], { allowSubdomains: true });
+const ARCHIVE_POLICY = hostAllowlistPolicy(["archive.org"], { allowSubdomains: true });
+const OPEN_LIBRARY_POLICY = hostAllowlistPolicy(["openlibrary.org"], { allowSubdomains: true });
+const DOAB_POLICY = hostAllowlistPolicy(["directory.doabooks.org"]);
+const SEP_POLICY = hostAllowlistPolicy(["plato.stanford.edu"]);
+const GUTENDEX_OPTS: FetchOpts = {
+  retries: 0,
+  timeoutMs: 8_000,
+  maxBytes: MAX_REMOTE_METADATA_BYTES,
+  urlPolicy: GUTENDEX_POLICY,
+};
 
 function decodeEntities(s: string): string {
   const named: Record<string, string> = {
@@ -230,33 +235,82 @@ function decodeEntities(s: string): string {
       const code = ent[1] === "x" || ent[1] === "X"
         ? parseInt(ent.slice(2), 16)
         : parseInt(ent.slice(1), 10);
-      return Number.isFinite(code) ? String.fromCodePoint(code) : m;
+      return Number.isFinite(code) && code >= 0 && code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff)
+        ? String.fromCodePoint(code)
+        : m;
     }
     return named[ent.toLowerCase()] ?? m;
   });
 }
 
-/** Strip HTML to readable plain text (no DOM): drop scripts/chrome, block tags -> newlines. */
-function htmlToText(html: string): string {
-  let s = html;
-  s = s.replace(/<!--[\s\S]*?-->/g, " ");
-  s = s.replace(/<(script|style|noscript|template|svg)\b[^>]*>[\s\S]*?<\/\1>/gi, " ");
-  s = s.replace(/<(nav|header|footer|aside|form)\b[^>]*>[\s\S]*?<\/\1>/gi, " ");
-  s = s.replace(/<\/?(p|div|section|article|li|tr|h[1-6]|blockquote|pre|ul|ol|table|br)\b[^>]*>/gi, "\n");
-  s = s.replace(/<[^>]+>/g, " ");
-  s = decodeEntities(s);
-  const out: string[] = [];
-  let blank = 0;
-  for (const raw of s.split(/\n/)) {
-    const line = raw.replace(/[ \t\f\v]+/g, " ").trim();
-    if (line) {
-      out.push(line);
-      blank = 0;
-    } else if (++blank <= 1) {
-      out.push("");
+/**
+ * Strip HTML in one forward pass. Cross-document lazy regexes are tempting
+ * here, but malformed repeated opening tags make those patterns quadratic.
+ */
+export function htmlToText(html: string): string {
+  const lower = html.toLowerCase();
+  const dropContent = new Set([
+    "script", "style", "noscript", "template", "svg",
+    "nav", "header", "footer", "aside", "form",
+  ]);
+  const blockTags = new Set([
+    "p", "div", "section", "article", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6",
+    "blockquote", "pre", "ul", "ol", "table", "br",
+  ]);
+  const pieces: string[] = [];
+  let textStart = 0;
+  let i = 0;
+  let tags = 0;
+  while (i < html.length) {
+    const tagStart = html.indexOf("<", i);
+    if (tagStart === -1) break;
+    if (++tags > 100_000) {
+      throw new Error("HTML contains too many tags to process safely.");
     }
+    if (tagStart > textStart) pieces.push(html.slice(textStart, tagStart));
+
+    if (lower.startsWith("<!--", tagStart)) {
+      const commentEnd = lower.indexOf("-->", tagStart + 4);
+      i = commentEnd === -1 ? html.length : commentEnd + 3;
+      textStart = i;
+      continue;
+    }
+
+    const tagEnd = html.indexOf(">", tagStart + 1);
+    if (tagEnd === -1) {
+      // Treat an unterminated tag as markup and stop; do not repeatedly scan it.
+      i = html.length;
+      textStart = i;
+      break;
+    }
+    const token = lower.slice(tagStart + 1, tagEnd).trimStart();
+    const nameMatch = token.match(/^\/?\s*([a-z][a-z0-9:-]*)/);
+    const name = nameMatch?.[1] ?? "";
+    const closing = token.startsWith("/");
+    if (!closing && dropContent.has(name)) {
+      const closingStart = lower.indexOf(`</${name}`, tagEnd + 1);
+      if (closingStart === -1) {
+        i = html.length;
+        textStart = i;
+        break;
+      }
+      const closingEnd = html.indexOf(">", closingStart + name.length + 2);
+      i = closingEnd === -1 ? html.length : closingEnd + 1;
+      pieces.push(" ");
+      textStart = i;
+      continue;
+    }
+    pieces.push(blockTags.has(name) ? "\n" : " ");
+    i = tagEnd + 1;
+    textStart = i;
   }
-  return out.join("\n").trim();
+  if (textStart < html.length) pieces.push(html.slice(textStart));
+  return decodeEntities(pieces.join(""))
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t\f\v]+/g, " ")
+    .replace(/ *\n */g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 /**
@@ -264,13 +318,16 @@ function htmlToText(html: string): string {
  * "ia:<id>", a URL). Lets a tool page through a long book with offset= without
  * re-downloading it each call — the body is fetched once, then sliced.
  */
-const bodyCache = new LruCache<string>(8);
+const bodyCache = new LruCache<string>(8, MAX_BODY_CACHE_BYTES, (body) =>
+  Buffer.byteLength(body),
+);
 
 /** Shared `offset` input field for the read tools — keeps paging consistent. */
 const offsetField = z
   .number()
   .int()
   .min(0)
+  .max(100_000_000)
   .default(0)
   .describe(
     "Character offset to start from (default 0). For long texts, read a window then call " +
@@ -281,25 +338,118 @@ const offsetField = z
 // Source-specific helpers
 // ---------------------------------------------------------------------------
 
+export function normalizeWikisourceLang(input: string): string {
+  const lang = input.trim().toLowerCase();
+  if (
+    lang.length > 32 ||
+    !/^[a-z]{2,12}(?:-[a-z0-9]{1,8})*$/.test(lang) ||
+    lang.includes("--")
+  ) {
+    throw new NetworkSecurityError(`Invalid Wikisource language code "${input}".`);
+  }
+  return lang;
+}
+
+export function normalizeArchiveIdentifier(input: string): string {
+  const identifier = input.trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(identifier)) {
+    throw new NetworkSecurityError(`Invalid Internet Archive identifier "${input}".`);
+  }
+  return identifier;
+}
+
+/** Canonicalize an SEP slug/path/URL while enforcing the exact SEP origin. */
+export function normalizeSepEntry(input: string): string {
+  const raw = input.trim();
+  let slug: string;
+  if (/^https?:/i.test(raw)) {
+    let url: URL;
+    try {
+      url = new URL(raw);
+    } catch {
+      throw new NetworkSecurityError(`Invalid SEP URL "${input}".`);
+    }
+    if (
+      url.protocol !== "https:" ||
+      url.hostname.toLowerCase() !== "plato.stanford.edu" ||
+      url.port ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash
+    ) {
+      throw new NetworkSecurityError("SEP entries must use the exact https://plato.stanford.edu origin.");
+    }
+    const match = url.pathname.match(/^\/entries\/([a-z0-9][a-z0-9-]*)\/?$/i);
+    if (!match) throw new NetworkSecurityError("SEP URL must identify one /entries/<slug>/ page.");
+    slug = match[1];
+  } else if (raw.startsWith("/")) {
+    const match = raw.match(/^\/entries\/([a-z0-9][a-z0-9-]*)\/?$/i);
+    if (!match) throw new NetworkSecurityError("SEP path must have the form /entries/<slug>/.");
+    slug = match[1];
+  } else {
+    slug = raw.replace(/\/$/, "");
+  }
+  if (!/^[a-z0-9][a-z0-9-]*$/i.test(slug)) {
+    throw new NetworkSecurityError(`Invalid SEP entry slug "${slug}".`);
+  }
+  return `https://plato.stanford.edu/entries/${slug.toLowerCase()}/`;
+}
+
+function configuredFetchHosts(): string[] {
+  const raw = process.env.PHILOSOPHY_FETCH_HOSTS ?? "";
+  const hosts = raw
+    .split(",")
+    .map((host) => host.trim().toLowerCase().replace(/\.$/, ""))
+    .filter(Boolean);
+  for (const host of hosts) {
+    if (!/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/.test(host) || host.includes("..")) {
+      throw new NetworkSecurityError(`Invalid PHILOSOPHY_FETCH_HOSTS entry "${host}".`);
+    }
+  }
+  return [...new Set(hosts)];
+}
+
+function genericFetchPolicy(): UrlPolicy {
+  const hosts = configuredFetchHosts();
+  if (hosts.length === 0) {
+    throw new NetworkSecurityError(
+      "fetch_text is disabled. Set PHILOSOPHY_FETCH_HOSTS to a comma-separated list of exact " +
+        "public hostnames to enable it.",
+    );
+  }
+  return hostAllowlistPolicy(hosts);
+}
+
 /** Fallback Gutenberg search via gutenberg.org's OPDS feed (when Gutendex is overloaded). */
 async function gutenbergOpds(terms: string, limit: number): Promise<Array<{ id: number; title: string; author: string }>> {
-  const body = await getText(`https://www.gutenberg.org/ebooks/search.opds/?query=${encodeURIComponent(terms)}`);
-  const root: any = atomXml.parse(body);
+  const body = await getText(
+    `https://www.gutenberg.org/ebooks/search.opds/?query=${encodeURIComponent(terms)}`,
+    { maxBytes: 2 * 1024 * 1024, urlPolicy: GUTENBERG_POLICY },
+  );
+  const root: any = await parseXmlSafely(body);
   const items: Array<{ id: number; title: string; author: string }> = [];
   for (const entry of asArr<any>(root?.feed?.entry)) {
     const title = String(entry?.title ?? "").trim();
-    const authorRaw = entry?.author?.name;
+    const content = entry?.content;
+    const contentText =
+      content && typeof content === "object" ? content["#text"] : content;
+    const authorRaw = entry?.author?.name ?? contentText;
     const author = String(Array.isArray(authorRaw) ? authorRaw[0] : authorRaw ?? "").trim();
     let bid: number | null = null;
     for (const ln of asArr<any>(entry?.link)) {
-      const m = String(ln?.["@_href"] ?? "").match(/\/(?:ebooks|epub|files|cache\/epub)\/(\d+)/);
+      const m = String(ln?.["@_href"] ?? "").match(
+        /\/(?:ebooks|epub|files|cache\/epub)\/(\d+)(?:[/.?#]|$)/,
+      );
       if (m) {
         bid = parseInt(m[1], 10);
         break;
       }
     }
     if (bid === null) {
-      const m = String(entry?.id ?? "").match(/(\d+)/);
+      // OPDS also contains facets/navigation entries whose query text may be
+      // numeric. Only a canonical ebook path is evidence of a Gutenberg id.
+      const m = String(entry?.id ?? "").match(/\/ebooks\/(\d+)(?:[/?#]|$)/);
       bid = m ? parseInt(m[1], 10) : null;
     }
     if (bid === null) continue; // skip facet/navigation entries
@@ -313,14 +463,47 @@ async function gutenbergOpds(terms: string, limit: number): Promise<Array<{ id: 
 let sepIndex: Array<[string, string]> | null = null;
 async function getSepIndex(): Promise<Array<[string, string]>> {
   if (sepIndex === null) {
-    const html = await getText("https://plato.stanford.edu/contents.html");
+    const html = await getText("https://plato.stanford.edu/contents.html", {
+      maxBytes: MAX_REMOTE_METADATA_BYTES,
+      urlPolicy: SEP_POLICY,
+    });
     const idx: Array<[string, string]> = [];
     const seen = new Set<string>();
-    const re = /href="(?:https:\/\/plato\.stanford\.edu\/)?(entries\/[^"#]+\/?)"[^>]*>([\s\S]*?)<\/a>/gi;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(html)) !== null) {
-      const title = htmlToText(m[2]).trim();
-      const url = new URL(m[1], "https://plato.stanford.edu/contents.html").toString();
+    const lower = html.toLowerCase();
+    let cursor = 0;
+    while (idx.length < 20_000) {
+      const anchorStart = lower.indexOf("<a", cursor);
+      if (anchorStart === -1) break;
+      const afterName = lower[anchorStart + 2] ?? "";
+      if (afterName && !/[\s/>]/.test(afterName)) {
+        cursor = anchorStart + 2;
+        continue;
+      }
+      const tagEnd = html.indexOf(">", anchorStart + 2);
+      if (tagEnd === -1) break;
+      if (tagEnd - anchorStart > 8192) {
+        cursor = tagEnd + 1;
+        continue;
+      }
+      const closeStart = lower.indexOf("</a", tagEnd + 1);
+      if (closeStart === -1) break;
+      const closeEnd = html.indexOf(">", closeStart + 3);
+      if (closeEnd === -1) break;
+      const opening = html.slice(anchorStart, tagEnd + 1);
+      const hrefMatch = opening.match(/\bhref\s*=\s*["']([^"']{1,2048})["']/i);
+      cursor = closeEnd + 1;
+      if (!hrefMatch) continue;
+      const rawHref = hrefMatch[1];
+      if (!/^(?:https:\/\/plato\.stanford\.edu\/)?entries\//i.test(rawHref)) continue;
+      const inner = html.slice(tagEnd + 1, Math.min(closeStart, tagEnd + 1 + 64_000));
+      const title = htmlToText(inner).trim().slice(0, 1000);
+      let url: string;
+      try {
+        const path = rawHref.replace(/^https:\/\/plato\.stanford\.edu\//i, "");
+        url = normalizeSepEntry(`/${path.replace(/^\//, "")}`);
+      } catch {
+        continue;
+      }
       if (!title || seen.has(url)) continue;
       seen.add(url);
       idx.push([title, url]);
@@ -345,10 +528,10 @@ export function registerBookTools(server: McpServer): void {
         "(Kant, Hegel, Nietzsche, Schopenhauer, Marx, Fichte, ...). Returns title, author, " +
         "languages, a Gutenberg page link, and download URLs. Use the numeric id with get_gutenberg_text.",
       inputSchema: {
-        query: z.string().default("").describe("Free-text search over title + author."),
-        author: z.string().default("").describe("Author name to fold into the search."),
-        topic: z.string().default("").describe("Subject/bookshelf filter, e.g. 'philosophy'."),
-        languages: z.string().default("").describe("Comma-separated ISO codes, e.g. 'en,de'."),
+        query: z.string().trim().max(1000).default("").describe("Free-text search over title + author."),
+        author: z.string().trim().max(1000).default("").describe("Author name to fold into the search."),
+        topic: z.string().trim().max(1000).default("").describe("Subject/bookshelf filter, e.g. 'philosophy'."),
+        languages: z.string().trim().max(256).default("").describe("Comma-separated ISO codes, e.g. 'en,de'."),
         limit: z.number().int().min(1).max(32).default(10).describe("Max results (1–32)."),
       },
     },
@@ -409,7 +592,7 @@ export function registerBookTools(server: McpServer): void {
         "Returns one window of max_chars from offset; whole books are long, so read a window and " +
         "page on with the offset in the footer. The downloaded body is cached, so paging is cheap.",
       inputSchema: {
-        book_id: z.number().int().describe("Gutenberg book id."),
+        book_id: z.number().int().positive().max(10_000_000).describe("Gutenberg book id."),
         max_chars: z.number().int().min(500).max(200_000).default(15_000).describe("Characters to return (default 15000)."),
         offset: offsetField,
       },
@@ -419,6 +602,7 @@ export function registerBookTools(server: McpServer): void {
       const key = `gut:${bid}`;
       let body = bodyCache.get(key) ?? "";
       if (!body) {
+        let lastRetrievalError: unknown;
         const candidates = [
           `https://www.gutenberg.org/cache/epub/${bid}/pg${bid}.txt`,
           `https://www.gutenberg.org/files/${bid}/${bid}-0.txt`,
@@ -426,12 +610,13 @@ export function registerBookTools(server: McpServer): void {
         ];
         for (const u of candidates) {
           try {
-            const t = await getText(u, { retries: 1 });
+            const t = await getText(u, { retries: 1, urlPolicy: GUTENBERG_POLICY });
             if (t && t.trim()) {
               body = t;
               break;
             }
-          } catch {
+          } catch (error) {
+            lastRetrievalError = error;
             /* try next layout */
           }
         }
@@ -441,15 +626,22 @@ export function registerBookTools(server: McpServer): void {
             const meta = await getJson(`https://gutendex.com/books/${bid}`, GUTENDEX_OPTS);
             const fmts: Record<string, string> = meta.formats ?? {};
             const url = Object.entries(fmts).find(([k, v]) => k.startsWith("text/plain") && !v.endsWith(".zip"))?.[1];
-            if (url) body = await getText(url, { retries: 1 });
-          } catch {
+            if (url) {
+              body = await getText(url, { retries: 1, urlPolicy: GUTENBERG_POLICY });
+            }
+          } catch (error) {
+            lastRetrievalError = error;
             /* ignore */
           }
         }
         if (!body.trim()) {
+          const detail = lastRetrievalError
+            ? ` Last retrieval error: ${errorSummary(lastRetrievalError)}.`
+            : "";
           return fail(
             `Could not download plain text for Gutenberg id ${bid}. ` +
-              `Try the epub from search_gutenberg or https://www.gutenberg.org/ebooks/${bid}.`,
+              `Try the epub from search_gutenberg or https://www.gutenberg.org/ebooks/${bid}.` +
+              detail,
           );
         }
         bodyCache.set(key, body);
@@ -469,9 +661,9 @@ export function registerBookTools(server: McpServer): void {
         "Search the Internet Archive for scanned, out-of-print monographs, journals, and " +
         "translations. Use the returned identifier with get_archive_text.",
       inputSchema: {
-        query: z.string().min(1).describe("Search terms."),
+        query: z.string().trim().min(1).max(1000).describe("Search terms."),
         limit: z.number().int().min(1).max(25).default(10).describe("Max results (1–25)."),
-        mediatype: z.string().default("texts").describe("Usually 'texts'; pass '' for all media."),
+        mediatype: z.string().trim().max(64).default("texts").describe("Usually 'texts'; pass '' for all media."),
       },
     },
     async ({ query, limit, mediatype }) => {
@@ -479,8 +671,11 @@ export function registerBookTools(server: McpServer): void {
         const q = mediatype ? `(${query}) AND mediatype:${mediatype}` : `(${query})`;
         const params = new URLSearchParams({ q, rows: String(limit), output: "json" });
         for (const f of ["identifier", "title", "creator", "year", "mediatype"]) params.append("fl[]", f);
-        const data = await getJson(`https://archive.org/advancedsearch.php?${params.toString()}`);
-        const docs: any[] = data?.response?.docs ?? [];
+        const data = await getJson(`https://archive.org/advancedsearch.php?${params.toString()}`, {
+          maxBytes: MAX_REMOTE_METADATA_BYTES,
+          urlPolicy: ARCHIVE_POLICY,
+        });
+        const docs: any[] = asArr<any>(data?.response?.docs).slice(0, limit);
         if (!docs.length) return ok("No Internet Archive matches.");
         const lines = docs.map((d) => {
           const creator = Array.isArray(d.creator) ? d.creator.join(", ") : d.creator ?? "—";
@@ -506,26 +701,42 @@ export function registerBookTools(server: McpServer): void {
         "search_internet_archive). Returns one window of max_chars from offset; scans are long, so " +
         "read a window and page on with the offset in the footer. The text is cached after first fetch.",
       inputSchema: {
-        identifier: z.string().min(1).describe("IA item identifier."),
+        identifier: z.string().trim().min(1).max(100).describe("IA item identifier."),
         max_chars: z.number().int().min(500).max(200_000).default(15_000).describe("Characters to return."),
         offset: offsetField,
       },
     },
     async ({ identifier, max_chars, offset }) => {
+      try {
+        identifier = normalizeArchiveIdentifier(identifier);
+      } catch (e: any) {
+        return fail(e?.message ?? String(e));
+      }
       const key = `ia:${identifier}`;
       let body = bodyCache.get(key) ?? "";
       if (!body) {
+        let lastRetrievalError: unknown;
+        const operationDeadline = Date.now() + 60_000;
         const candidates = [`https://archive.org/download/${identifier}/${identifier}_djvu.txt`];
         try {
-          const meta = await getJson(`https://archive.org/metadata/${identifier}`);
-          for (const f of asArr<any>(meta.files)) {
+          const meta = await getJson(`https://archive.org/metadata/${identifier}`, {
+            maxBytes: MAX_REMOTE_METADATA_BYTES,
+            timeoutMs: 15_000,
+            urlPolicy: ARCHIVE_POLICY,
+          });
+          for (const f of asArr<any>(meta.files).slice(0, 200)) {
             const name = String(f.name ?? "");
             const fmt = String(f.format ?? "").toLowerCase();
-            if (name.endsWith("_djvu.txt") || (name.endsWith(".txt") && fmt.includes("text"))) {
+            if (
+              candidates.length < 3 &&
+              name.length <= 1024 &&
+              (name.endsWith("_djvu.txt") || (name.endsWith(".txt") && fmt.includes("text")))
+            ) {
               candidates.push(`https://archive.org/download/${identifier}/${encodeURIComponent(name)}`);
             }
           }
-        } catch {
+        } catch (error) {
+          lastRetrievalError = error;
           /* ignore — fall back to the conventional name */
         }
         const seen = new Set<string>();
@@ -533,19 +744,29 @@ export function registerBookTools(server: McpServer): void {
           if (seen.has(u)) continue;
           seen.add(u);
           try {
-            const t = await getText(u, { retries: 1 });
+            const remaining = operationDeadline - Date.now();
+            if (remaining <= 0) break;
+            const t = await getText(u, {
+              retries: 1,
+              timeoutMs: Math.min(20_000, remaining),
+              urlPolicy: ARCHIVE_POLICY,
+            });
             if (t && t.trim()) {
               body = t;
               break;
             }
-          } catch {
+          } catch (error) {
+            lastRetrievalError = error;
             /* try next candidate */
           }
         }
         if (!body.trim()) {
+          const detail = lastRetrievalError
+            ? ` Last retrieval error: ${errorSummary(lastRetrievalError)}.`
+            : "";
           return fail(
             `No OCR text file found for "${identifier}" (may be image-only or restricted). ` +
-              `Browse it at https://archive.org/details/${identifier}`,
+              `Browse it at https://archive.org/details/${identifier}.` + detail,
           );
         }
         bodyCache.set(key, body);
@@ -563,19 +784,24 @@ export function registerBookTools(server: McpServer): void {
         "Search Wikisource for primary texts and translations (en, de, ko, ...). " +
         "Use get_wikisource_text to read.",
       inputSchema: {
-        query: z.string().min(1).describe("Search terms."),
-        lang: z.string().default("en").describe("Wikisource language subdomain (en, de, ko...)."),
+        query: z.string().trim().min(1).max(1000).describe("Search terms."),
+        lang: z.string().trim().max(32).default("en").describe("Wikisource language subdomain (en, de, ko...)."),
         limit: z.number().int().min(1).max(25).default(10).describe("Max results (1–25)."),
       },
     },
     async ({ query, lang, limit }) => {
       try {
+        lang = normalizeWikisourceLang(lang);
+        const policy = hostAllowlistPolicy([`${lang}.wikisource.org`]);
         const params = new URLSearchParams({
           action: "query", list: "search", srsearch: query,
           srlimit: String(limit), format: "json", srprop: "snippet",
         });
-        const data = await getJson(`https://${lang}.wikisource.org/w/api.php?${params.toString()}`);
-        const hits: any[] = data?.query?.search ?? [];
+        const data = await getJson(`https://${lang}.wikisource.org/w/api.php?${params.toString()}`, {
+          maxBytes: MAX_REMOTE_METADATA_BYTES,
+          urlPolicy: policy,
+        });
+        const hits: any[] = asArr<any>(data?.query?.search).slice(0, limit);
         if (!hits.length) return ok(`No ${lang}.wikisource matches.`);
         const lines = hits.map((h) => {
           const title = String(h.title ?? "?");
@@ -598,35 +824,47 @@ export function registerBookTools(server: McpServer): void {
         "Fetch the plain text of a Wikisource page by title (from search_wikisource). Returns one " +
         "window of max_chars from offset; page on with the offset in the footer. Cached after first fetch.",
       inputSchema: {
-        title: z.string().min(1).describe("Exact page title."),
-        lang: z.string().default("en").describe("Wikisource language subdomain."),
+        title: z.string().trim().min(1).max(1000).describe("Exact page title."),
+        lang: z.string().trim().max(32).default("en").describe("Wikisource language subdomain."),
         max_chars: z.number().int().min(500).max(200_000).default(15_000).describe("Characters to return."),
         offset: offsetField,
       },
     },
     async ({ title, lang, max_chars, offset }) => {
-      const key = `ws:${lang}:${title}`;
       try {
+        lang = normalizeWikisourceLang(lang);
+        const policy = hostAllowlistPolicy([`${lang}.wikisource.org`]);
+        const key = `ws:${lang}:${title}`;
         let cached = bodyCache.get(key);
         let pageTitle = title;
         if (cached === undefined) {
           const params = new URLSearchParams({
-            action: "query", prop: "extracts", explaintext: "1",
-            titles: title, format: "json", redirects: "1",
+            action: "parse",
+            page: title,
+            prop: "text",
+            format: "json",
+            formatversion: "2",
+            redirects: "1",
           });
-          const data = await getJson(`https://${lang}.wikisource.org/w/api.php?${params.toString()}`);
-          const pages: Record<string, any> = data?.query?.pages ?? {};
-          for (const page of Object.values(pages)) {
-            const extract = String(page?.extract ?? "");
-            if (extract.trim()) {
-              cached = extract;
-              pageTitle = String(page?.title ?? title);
-              bodyCache.set(key, extract);
-              break;
-            }
+          const data = await getJson(`https://${lang}.wikisource.org/w/api.php?${params.toString()}`, {
+            maxBytes: 8 * 1024 * 1024,
+            urlPolicy: policy,
+          });
+          const rendered =
+            typeof data?.parse?.text === "string"
+              ? data.parse.text
+              : String(data?.parse?.text?.["*"] ?? "");
+          const extracted = htmlToText(rendered);
+          if (extracted.trim()) {
+            cached = extracted;
+            pageTitle = String(data?.parse?.title ?? title);
+            bodyCache.set(key, extracted);
           }
           if (cached === undefined) {
-            return fail(`No extractable text for "${title}" on ${lang}.wikisource. Verify the title via search_wikisource.`);
+            return fail(
+              `No rendered text for "${title}" on ${lang}.wikisource. ` +
+                "Verify the title via search_wikisource.",
+            );
           }
         }
         return ok(renderWindow(`# ${pageTitle} (Wikisource ${lang})`, cached, max_chars, offset));
@@ -645,8 +883,8 @@ export function registerBookTools(server: McpServer): void {
         "Search Open Library for books — strong for modern editions and translations as metadata, " +
         "with read/borrow links wherever a scan exists.",
       inputSchema: {
-        query: z.string().min(1).describe("Title or keywords, e.g. 'Being and Time Heidegger'."),
-        author: z.string().default("").describe("Optional author filter."),
+        query: z.string().trim().min(1).max(1000).describe("Title or keywords, e.g. 'Being and Time Heidegger'."),
+        author: z.string().trim().max(1000).default("").describe("Optional author filter."),
         limit: z.number().int().min(1).max(25).default(10).describe("Max results (1–25)."),
       },
     },
@@ -657,7 +895,10 @@ export function registerBookTools(server: McpServer): void {
           fields: "title,author_name,first_publish_year,key,ia,ebook_access,edition_count",
         });
         if (author) params.set("author", author);
-        const data = await getJson(`https://openlibrary.org/search.json?${params.toString()}`);
+        const data = await getJson(`https://openlibrary.org/search.json?${params.toString()}`, {
+          maxBytes: MAX_REMOTE_METADATA_BYTES,
+          urlPolicy: OPEN_LIBRARY_POLICY,
+        });
         const docs: any[] = (data.docs ?? []).slice(0, limit);
         if (!docs.length) return ok("No Open Library matches.");
         const lines = docs.map((d) => {
@@ -671,7 +912,8 @@ export function registerBookTools(server: McpServer): void {
             read ? `   read/borrow: ${read}` : "",
           ].filter(Boolean).join("\n");
         });
-        return ok([`Open Library — ${data.numFound ?? 0} total, showing ${docs.length}:`, "", ...lines].join("\n"));
+        const total = data.num_found ?? data.numFound ?? 0;
+        return ok([`Open Library — ${total} total, showing ${docs.length}:`, "", ...lines].join("\n"));
       } catch (e: any) {
         return fail(`Open Library request failed: ${e?.message ?? e}`);
       }
@@ -687,7 +929,7 @@ export function registerBookTools(server: McpServer): void {
         "Search the Directory of Open Access Books — peer-reviewed, fully open-access academic " +
         "books, including many modern philosophy monographs readable in full.",
       inputSchema: {
-        query: z.string().min(1).describe("Search terms (title/author/keyword)."),
+        query: z.string().trim().min(1).max(1000).describe("Search terms (title/author/keyword)."),
         limit: z.number().int().min(1).max(25).default(10).describe("Max results (1–25)."),
       },
     },
@@ -695,7 +937,10 @@ export function registerBookTools(server: McpServer): void {
       const manual = `https://directory.doabooks.org/discover?query=${encodeURIComponent(query)}`;
       try {
         const params = new URLSearchParams({ query, expand: "metadata", limit: String(limit) });
-        const data = await getJson(`https://directory.doabooks.org/rest/search?${params.toString()}`);
+        const data = await getJson(`https://directory.doabooks.org/rest/search?${params.toString()}`, {
+          maxBytes: MAX_REMOTE_METADATA_BYTES,
+          urlPolicy: DOAB_POLICY,
+        });
         if (!Array.isArray(data) || !data.length) return ok(`No DOAB matches. Browse: ${manual}`);
         const lines = data.slice(0, limit).map((item: any) => {
           const mds = asArr<any>(item.metadata).filter((m) => m && typeof m === "object");
@@ -731,14 +976,14 @@ export function registerBookTools(server: McpServer): void {
         "Search SEP (the standard scholarly reference) by matching its full entry index. " +
         "Read an entry with get_sep_entry.",
       inputSchema: {
-        query: z.string().min(1).describe("Topic or philosopher, e.g. 'Hegel', 'phenomenology'."),
+        query: z.string().trim().min(1).max(1000).describe("Topic or philosopher, e.g. 'Hegel', 'phenomenology'."),
         limit: z.number().int().min(1).max(20).default(10).describe("Max results (1–20)."),
       },
     },
     async ({ query, limit }) => {
       try {
         const idx = await getSepIndex();
-        const words = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
+        const words = query.toLowerCase().trim().split(/\s+/).filter(Boolean).slice(0, 32);
         if (!words.length) return fail("Provide a search term.");
         let matches = idx.filter(([t]) => words.every((w) => t.toLowerCase().includes(w)));
         if (!matches.length) matches = idx.filter(([t]) => words.some((w) => t.toLowerCase().includes(w)));
@@ -764,7 +1009,7 @@ export function registerBookTools(server: McpServer): void {
         "full URL. Returns one window of max_chars from offset; SEP entries are long, so read a " +
         "window and page on with the offset in the footer. Cached after first fetch.",
       inputSchema: {
-        entry: z.string().min(1).describe("Entry slug, /entries/.. path, or full URL."),
+        entry: z.string().trim().min(1).max(2048).describe("Entry slug, /entries/.. path, or full URL."),
         max_chars: z.number().int().min(500).max(200_000).default(15_000).describe("Characters to return."),
         offset: offsetField,
       },
@@ -772,23 +1017,13 @@ export function registerBookTools(server: McpServer): void {
     async ({ entry, max_chars, offset }) => {
       let url = "";
       try {
-        if (entry.startsWith("http")) {
-          // A full URL must point at SEP itself — don't let this tool fetch
-          // arbitrary hosts.
-          const u = new URL(entry);
-          if (u.protocol !== "https:" || u.hostname !== "plato.stanford.edu") {
-            return fail(`get_sep_entry only accepts https://plato.stanford.edu/... URLs (got "${entry}").`);
-          }
-          url = u.toString();
-        } else if (entry.startsWith("/")) {
-          url = new URL(entry, "https://plato.stanford.edu").toString();
-        } else {
-          url = `https://plato.stanford.edu/entries/${entry.replace(/^\/|\/$/g, "")}/`;
-        }
+        url = normalizeSepEntry(entry);
         const key = `sep:${url}`;
         let text = bodyCache.get(key);
         if (text === undefined) {
-          text = htmlToText(await getText(url));
+          text = htmlToText(
+            await getText(url, { maxBytes: 8 * 1024 * 1024, urlPolicy: SEP_POLICY }),
+          );
           bodyCache.set(key, text);
         }
         return ok(renderWindow(`# SEP entry: ${url}`, text, max_chars, offset));
@@ -802,24 +1037,39 @@ export function registerBookTools(server: McpServer): void {
   server.registerTool(
     "fetch_text",
     {
-      title: "Fetch readable text from any URL",
+      title: "Fetch readable text from an allowlisted URL",
       description:
-        "Fetch any URL and return its readable text — the catch-all for sources without a " +
-        "dedicated tool: Zeno.org and projekt-gutenberg.org (German originals), marxists.org " +
-        "(German Idealism to Frankfurt School translations), Standard Ebooks, a specific page, etc. " +
+        "Fetch readable text from a URL whose exact hostname appears in the server's " +
+        "PHILOSOPHY_FETCH_HOSTS allowlist. The tool is disabled when that setting is empty. " +
         "Returns one window of max_chars from offset; page on with the offset in the footer. Cached per URL.",
       inputSchema: {
-        url: z.string().url().describe("The page or text-file URL."),
+        url: z.string().trim().max(4096).url().describe("The page or text-file URL."),
         max_chars: z.number().int().min(500).max(200_000).default(15_000).describe("Characters to return."),
         offset: offsetField,
       },
     },
     async ({ url, max_chars, offset }) => {
       try {
+        const policy = genericFetchPolicy();
+        const canonical = new URL(url);
+        canonical.hash = "";
+        url = canonical.toString();
         const key = `url:${url}`;
         let text = bodyCache.get(key);
         if (text === undefined) {
-          const { contentType, body } = await bookRequest(url, { guard: assertPublicUrl });
+          const { contentType, body } = await bookRequest(url, {
+            maxBytes: MAX_GENERIC_FETCH_BYTES,
+            urlPolicy: policy,
+          });
+          if (
+            contentType &&
+            !contentType.startsWith("text/") &&
+            !contentType.includes("html") &&
+            !contentType.includes("xml") &&
+            !contentType.includes("json")
+          ) {
+            return fail(`Fetch refused non-text content type "${contentType}" from ${url}.`);
+          }
           text =
             contentType.includes("html") || body.trimStart().startsWith("<") ? htmlToText(body) : body;
           if (!text.trim()) return ok(`Fetched ${url} but found no readable text (binary or JS-only page?).`);
